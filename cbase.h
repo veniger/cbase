@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /*
     This mini library is a C99 language code base for my projects to be ever expanded upon
@@ -59,8 +60,44 @@ typedef enum
 
     /* Memory errors */
     CB_INFO_ALLOC_FAILED,
+    CB_INFO_ARENA_OUT_OF_MEMORY,
 
 } cb_info_t;
+
+/* SEG Memory / Arena Allocator */
+
+typedef enum
+{
+    CB_ARENA_FIXED = 0,
+    CB_ARENA_LINEAR,
+    CB_ARENA_EXPONENTIAL,
+} cb_arena_strategy_t;
+
+typedef struct cb__arena_block_t cb__arena_block_t;
+
+typedef struct
+{
+    cb_info_t info;
+    cb_arena_strategy_t strategy;
+    size_t initial_size;
+    cb__arena_block_t *head;
+    cb__arena_block_t *current;
+} cb_arena_t;
+
+typedef struct
+{
+    cb_info_t info;
+    void *ptr;
+} cb_arena_alloc_result_t;
+
+cb_arena_t              cb_arena_create(size_t size, cb_arena_strategy_t strategy);
+void                    cb_arena_destroy(cb_arena_t *arena);
+cb_arena_alloc_result_t cb_arena_alloc(cb_arena_t *arena, size_t size, size_t align);
+void                    cb_arena_reset(cb_arena_t *arena);
+
+/* Internal alloc/free helpers: if arena is NULL, fall back to malloc/free */
+void *cb__alloc(cb_arena_t *arena, size_t size, size_t align);
+void  cb__free(cb_arena_t *arena, void *ptr);
 
 /* SEG Math */
 
@@ -88,17 +125,17 @@ typedef cb_thread_result_t (*cb_thread_function_t)(void *arg);
 typedef struct
 {
     cb_info_t info;
+    void *cb__internal;
 #ifdef CB_PLATFORM_POSIX
     pthread_t handle;
 #else
     HANDLE handle;
-    void *cb__internal; /* trampoline arg, do not touch */
 #endif
 } cb_thread_t;
 
-cb_thread_t         cb_thread_create(cb_thread_function_t fn, void *arg);
-cb_thread_result_t  cb_thread_join(cb_thread_t thread);
-cb_info_t           cb_thread_detach(cb_thread_t thread);
+cb_thread_t         cb_thread_create(cb_arena_t *arena, cb_thread_function_t fn, void *arg);
+cb_thread_result_t  cb_thread_join(cb_thread_t *thread);
+cb_info_t           cb_thread_detach(cb_thread_t *thread);
 
 /* --- Mutex --- */
 
@@ -159,8 +196,8 @@ typedef struct
     void *data;
 } cb_tsqueue_item_t;
 
-cb_tsqueue_t        cb_tsqueue_create(uint32_t capacity);
-cb_info_t           cb_tsqueue_destroy(cb_tsqueue_t *queue);
+cb_tsqueue_t        cb_tsqueue_create(cb_arena_t *arena, uint32_t capacity);
+cb_info_t           cb_tsqueue_destroy(cb_arena_t *arena, cb_tsqueue_t *queue);
 
 cb_info_t           cb_tsqueue_push(cb_tsqueue_t *queue, void *item);
 cb_tsqueue_item_t   cb_tsqueue_pop(cb_tsqueue_t *queue);
