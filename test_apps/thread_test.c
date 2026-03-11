@@ -104,6 +104,27 @@ int main(void)
         return 1;
     }
 
+    /* --- Guard bytes health check --- */
+    if (cb_arena_check_health(&arena))
+    {
+        printf("Arena health check: OK\n");
+    }
+    else
+    {
+        printf("Arena health check: CORRUPTED\n");
+        return 1;
+    }
+
+    if (cb_arena_check_health(&fixed))
+    {
+        printf("Fixed arena health check: OK\n");
+    }
+    else
+    {
+        printf("Fixed arena health check: CORRUPTED\n");
+        return 1;
+    }
+
     cb_arena_destroy(&fixed);
     cb_arena_destroy(&arena);
 

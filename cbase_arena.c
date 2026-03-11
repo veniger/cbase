@@ -3,30 +3,61 @@
 
 /* --- Arena block (internal) --- */
 
+#define CB__GUARD_SIZE 16
+#define CB__GUARD_BYTE 0xCB
+
+/*
+    Block memory layout (single malloc):
+    [ cb__arena_block_t | guard_head[16] | user data ... | guard_tail[16] ]
+
+    block->data points to the start of user data.
+    Guard bytes are filled with 0xCB and checked by cb_arena_check_health().
+*/
+
 struct cb__arena_block_t
 {
-    uint8_t *data;
     size_t size;
     size_t used;
+    uint8_t *data;
     cb__arena_block_t *next;
 };
 
 static cb__arena_block_t *cb__arena_block_create(size_t size)
 {
-    cb__arena_block_t *block = (cb__arena_block_t *)malloc(sizeof(cb__arena_block_t));
-    if (!block) return NULL;
+    size_t total = sizeof(cb__arena_block_t) + CB__GUARD_SIZE + size + CB__GUARD_SIZE;
 
-    block->data = (uint8_t *)malloc(size);
-    if (!block->data)
-    {
-        free(block);
-        return NULL;
-    }
+    uint8_t *raw = (uint8_t *)malloc(total);
+    if (!raw) return NULL;
 
+    cb__arena_block_t *block = (cb__arena_block_t *)raw;
+    uint8_t *guard_head = raw + sizeof(cb__arena_block_t);
+    uint8_t *data       = guard_head + CB__GUARD_SIZE;
+    uint8_t *guard_tail = data + size;
+
+    memset(guard_head, CB__GUARD_BYTE, CB__GUARD_SIZE);
+    memset(guard_tail, CB__GUARD_BYTE, CB__GUARD_SIZE);
+
+    block->data = data;
     block->size = size;
     block->used = 0;
     block->next = NULL;
+
     return block;
+}
+
+static bool cb__arena_block_check_guards(cb__arena_block_t *block)
+{
+    uint8_t *guard_head = block->data - CB__GUARD_SIZE;
+    uint8_t *guard_tail = block->data + block->size;
+    size_t i;
+
+    for (i = 0; i < CB__GUARD_SIZE; i++)
+    {
+        if (guard_head[i] != CB__GUARD_BYTE) return false;
+        if (guard_tail[i] != CB__GUARD_BYTE) return false;
+    }
+
+    return true;
 }
 
 static void cb__arena_block_destroy(cb__arena_block_t *block)
@@ -34,7 +65,7 @@ static void cb__arena_block_destroy(cb__arena_block_t *block)
     while (block)
     {
         cb__arena_block_t *next = block->next;
-        free(block->data);
+        /* block itself is the base of the single allocation */
         free(block);
         block = next;
     }
@@ -164,6 +195,17 @@ void cb_arena_reset(cb_arena_t *arena)
         block = block->next;
     }
     arena->current = arena->head;
+}
+
+bool cb_arena_check_health(cb_arena_t *arena)
+{
+    cb__arena_block_t *block = arena->head;
+    while (block)
+    {
+        if (!cb__arena_block_check_guards(block)) return false;
+        block = block->next;
+    }
+    return true;
 }
 
 /* --- Internal alloc/free helpers --- */

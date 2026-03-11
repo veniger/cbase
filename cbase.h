@@ -94,6 +94,7 @@ cb_arena_t              cb_arena_create(size_t size, cb_arena_strategy_t strateg
 void                    cb_arena_destroy(cb_arena_t *arena);
 cb_arena_alloc_result_t cb_arena_alloc(cb_arena_t *arena, size_t size, size_t align);
 void                    cb_arena_reset(cb_arena_t *arena);
+bool                    cb_arena_check_health(cb_arena_t *arena);
 
 /* Internal alloc/free helpers: if arena is NULL, fall back to malloc/free */
 void *cb__alloc(cb_arena_t *arena, size_t size, size_t align);
