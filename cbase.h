@@ -101,6 +101,10 @@ typedef enum
     CB_INFO_CONFIG_BAD_INT,
     CB_INFO_CONFIG_BAD_BOOL,
 
+    /* Log errors */
+    CB_INFO_LOG_INVALID_SINK,         /* reserved; sink setter currently accepts any FILE* incl. NULL */
+    CB_INFO_LOG_WRITE_FAILED,         /* fwrite returned short; recorded, never retried */
+
 } cb_info_t;
 
 /* SEG Memory / Arena Allocator */
@@ -506,6 +510,70 @@ typedef struct { cb_info_t info; bool     value; } cb_config_bool_t;
 cb_config_i64_t  cb_config_get_i64 (const cb_config_t *cfg, const char *key, int64_t  fallback);
 cb_config_u64_t  cb_config_get_u64 (const cb_config_t *cfg, const char *key, uint64_t fallback);
 cb_config_bool_t cb_config_get_bool(const cb_config_t *cfg, const char *key, bool     fallback);
+
+/* SEG Log */
+
+/*
+    Minimal process-global thread-safe structured logger.
+
+    One global logger. stderr is the default (always-on) sink; an optional
+    secondary FILE* sink can be attached for file logging. Levels filter
+    emission; set min_level to CB_LOG_OFF to silence everything.
+
+    Format (one line, ASCII):
+        [   12.345678] INFO  net    handshake accepted fd=7
+      - "[%10.6f]" seconds-since-init (monotonic, integer math, no float)
+      - 5-col level tag ("TRACE", "DEBUG", "INFO ", "WARN ", "ERROR", "FATAL")
+      - 6-col module tag (left-aligned, truncated at 16 chars; NULL -> 6 spaces)
+      - printf-formatted message, trailing newline.
+      - Stack format buffer is 4096 bytes; overruns are truncated with a
+        trailing "...[TRUNC]" marker. Log calls never fail visibly.
+
+    Color (stderr only, never the file sink):
+      - TRACE dim, DEBUG cyan, INFO none, WARN yellow, ERROR red, FATAL bold red.
+      - Default: auto (isatty(stderr)); override with cb_log_set_color.
+
+    Thread safety:
+      - Formatting into a per-call stack buffer is lock-free; a single mutex
+        serializes fwrite+fflush to each sink.
+      - First log call lazily initializes the global state under an internal
+        once-gate; cb_log_init is an explicit alternative.
+
+    Sink lifetime:
+      - cb_log_set_file_sink(NULL) detaches; non-NULL attaches. Caller retains
+        ownership and is responsible for fclose. Not safe to call concurrently
+        with logging — invoke during setup/teardown.
+
+    No convenience macros are exposed. Userland may define CB_LOG_INFO(...) etc.
+    on top of cb_log(...) without conflicting with common names.
+*/
+
+#include <stdio.h>
+#include <stdarg.h>
+
+typedef enum
+{
+    CB_LOG_TRACE = 0,
+    CB_LOG_DEBUG = 1,
+    CB_LOG_INFO  = 2,
+    CB_LOG_WARN  = 3,
+    CB_LOG_ERROR = 4,
+    CB_LOG_FATAL = 5,
+    CB_LOG_OFF   = 6
+} cb_log_level_t;
+
+void           cb_log_init(void);                    /* Optional; lazy init is safe. */
+void           cb_log_set_level(cb_log_level_t min_level);
+cb_log_level_t cb_log_get_level(void);
+void           cb_log_set_color(bool enabled);
+void           cb_log_set_timestamps(bool enabled);
+
+/* Attach/detach the secondary sink. NULL detaches. Not thread-safe w.r.t.
+   concurrent log calls — call during setup/teardown. Ownership is NOT
+   transferred; caller must fclose. Returns CB_INFO_OK in both cases. */
+cb_info_t      cb_log_set_file_sink(FILE *f);
+
+void           cb_log(cb_log_level_t level, const char *module, const char *fmt, ...);
 
 /* SEG System Stuff */
 

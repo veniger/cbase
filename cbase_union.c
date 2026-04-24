@@ -8,3 +8,4 @@
 #include "cbase_bytes.c"
 #include "cbase_time.c"
 #include "cbase_config.c"
+#include "cbase_log.c"
