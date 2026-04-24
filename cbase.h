@@ -88,6 +88,19 @@ typedef enum
     CB_INFO_TIME_BAD_TICK_HZ,
     CB_INFO_TIME_TICK_LAG,
 
+    /* Config errors */
+    CB_INFO_CONFIG_PARSE_ERROR,       /* malformed key/value syntax */
+    CB_INFO_CONFIG_BAD_KEY,           /* key fails [A-Za-z_][A-Za-z0-9_.-]* regex */
+    CB_INFO_CONFIG_UNTERMINATED_STRING,
+    CB_INFO_CONFIG_BAD_ESCAPE,
+    CB_INFO_CONFIG_LINE_TOO_LONG,
+    CB_INFO_CONFIG_FILE_OPEN_FAILED,
+    CB_INFO_CONFIG_FILE_TOO_LARGE,    /* >16 MiB (cap on parse_file) */
+    CB_INFO_CONFIG_ALLOC_FAILED,
+    CB_INFO_CONFIG_KEY_NOT_FOUND,
+    CB_INFO_CONFIG_BAD_INT,
+    CB_INFO_CONFIG_BAD_BOOL,
+
 } cb_info_t;
 
 /* SEG Memory / Arena Allocator */
@@ -410,6 +423,89 @@ cb_tick_loop_t      cb_tick_loop_create(uint32_t tick_hz, uint32_t max_ticks_per
 cb_tick_loop_step_t cb_tick_loop_advance(cb_tick_loop_t *loop);
 cb_fx16_t           cb_tick_loop_alpha(const cb_tick_loop_t *loop);
 void                cb_tick_loop_reset(cb_tick_loop_t *loop);
+
+/* SEG Config */
+
+/*
+    Minimal key/value config parser. Flat namespace, no sections.
+
+    Grammar:
+      - Blank lines ignored.
+      - Lines starting with '#' or ';' (after leading whitespace) are
+        full-line comments.
+      - Otherwise: split on FIRST '='. LHS is the key, RHS is the value.
+      - Keys must match [A-Za-z_][A-Za-z0-9_.-]* (dot and dash allowed for
+        namespacing like "net.udp.port"). Empty key -> parse error.
+      - Values:
+          * Leading/trailing whitespace stripped.
+          * If the stripped value starts with '"', the value is the contents
+            between the first '"' and the matching closing '"' on the same
+            line. Backslash escapes inside quotes: \", \\, \n, \t, \r.
+            Any other \x is an error.
+          * If NOT quoted, an unescaped '#' or ';' starts a trailing comment
+            and is stripped; the remaining characters are the value (then
+            trailing whitespace is re-stripped). Backslash has no special
+            meaning in unquoted values.
+      - Duplicate keys: the LATER value wins (typical override semantics).
+      - Keys are case-sensitive.
+      - Line length cap: 4096 bytes. Exceeding it -> CB_INFO_CONFIG_LINE_TOO_LONG
+        with the 1-based line number recorded on the returned struct.
+
+    Storage:
+      - Entries stored in a singly-linked list in parse order. Lookup is O(n);
+        config files are tiny, so no hash table.
+      - Key and value strings are duplicated into freshly cb__alloc'ed buffers
+        (null-terminated). On duplicate key, the value buffer is replaced.
+
+    Allocation:
+      - Follows the cbase convention: arena != NULL uses the arena, arena == NULL
+        falls back to malloc/free.
+      - cb_config_destroy is safe on a failed parse and safe on both allocator
+        modes.
+
+    Typed getters:
+      - Integer parsing is base-10 only, no hex, no oct, no underscores.
+      - i64 accepts optional leading '-'. u64 does not.
+      - Bool accepts true/false, yes/no, on/off, 1/0 (case-insensitive).
+      - Missing key -> CB_INFO_CONFIG_KEY_NOT_FOUND + fallback.
+      - Unparseable    -> CB_INFO_CONFIG_BAD_INT / CB_INFO_CONFIG_BAD_BOOL + fallback.
+      - Present + parseable -> CB_INFO_OK + parsed value.
+*/
+
+typedef struct cb__config_entry_t cb__config_entry_t;
+
+typedef struct
+{
+    cb_info_t           info;
+    uint32_t            error_line;       /* 1-based on parse error; 0 on success */
+    uint32_t            count;            /* number of unique keys */
+    cb_arena_t         *arena;            /* nullable; same allocate-on-arena-or-malloc convention */
+    cb__config_entry_t *head;             /* opaque linked list; internal */
+} cb_config_t;
+
+/* Load from a null-terminated text buffer. `len` is the number of bytes to
+   consume (the buffer does not need to end with '\0'; len is authoritative). */
+cb_config_t cb_config_parse(cb_arena_t *arena, const char *text, size_t len);
+
+/* Load from a file on disk. Returns CB_INFO_CONFIG_FILE_OPEN_FAILED on open
+   error. Files larger than 16 MiB error with CB_INFO_CONFIG_FILE_TOO_LARGE. */
+cb_config_t cb_config_parse_file(cb_arena_t *arena, const char *path);
+
+/* Frees all entries (via cb__free per entry). Safe on a failed parse. */
+void        cb_config_destroy(cb_config_t *cfg);
+
+/* Lookup. Returns NULL if absent. Pointer is stable until destroy / reparse. */
+const char *cb_config_get(const cb_config_t *cfg, const char *key);
+
+/* Typed getters. If key missing or value unparseable, write fallback into
+   the value field and return the corresponding info code. */
+typedef struct { cb_info_t info; int64_t  value; } cb_config_i64_t;
+typedef struct { cb_info_t info; uint64_t value; } cb_config_u64_t;
+typedef struct { cb_info_t info; bool     value; } cb_config_bool_t;
+
+cb_config_i64_t  cb_config_get_i64 (const cb_config_t *cfg, const char *key, int64_t  fallback);
+cb_config_u64_t  cb_config_get_u64 (const cb_config_t *cfg, const char *key, uint64_t fallback);
+cb_config_bool_t cb_config_get_bool(const cb_config_t *cfg, const char *key, bool     fallback);
 
 /* SEG System Stuff */
 
