@@ -262,6 +262,124 @@ static int section9_reset(void)
     return 0;
 }
 
+/* ---------- section 10: manual clock advances ticks ---------- */
+
+static uint64_t g_manual_clock_ns = 0;
+static uint64_t manual_clock(void *u) { (void)u; return g_manual_clock_ns; }
+
+static int section10_manual_clock_advances(void)
+{
+    printf("--- Section 10: manual clock advances ticks\n");
+
+    /* 1000 Hz -> tick_ns = 1_000_000 ns = 1 ms. */
+    cb_tick_loop_t loop = cb_tick_loop_create(1000, 0);
+    CHECK(loop.info == CB_INFO_OK, "1000Hz create OK");
+
+    g_manual_clock_ns = 1000ull; /* arbitrary non-zero baseline */
+    cb_tick_loop_set_clock(&loop, manual_clock, NULL);
+
+    /* Baseline advance — uses the manual clock. */
+    cb_tick_loop_step_t step0 = cb_tick_loop_advance(&loop);
+    CHECK(step0.ticks_to_run == 0, "baseline advance yields 0 ticks");
+    CHECK(loop.last_time_ns == 1000ull, "baseline seeds last_time_ns from manual clock");
+
+    /* Jump forward 5 ms on the manual clock: expect exactly 5 ticks, 0 leftover. */
+    g_manual_clock_ns = 1000ull + 5ull * 1000000ull;
+    cb_tick_loop_step_t step1 = cb_tick_loop_advance(&loop);
+    CHECK(step1.info == CB_INFO_OK, "advance info OK");
+    CHECK(step1.ticks_to_run == 5, "5ms of manual clock == 5 ticks @ 1000Hz");
+    CHECK(step1.leftover_ns == 0, "whole ms -> zero leftover");
+    CHECK(loop.sim_tick_index == 5, "sim_tick_index == 5");
+
+    /* Jump forward 2.5 ms: expect 2 ticks with 500_000 ns leftover. */
+    g_manual_clock_ns += 2500000ull;
+    cb_tick_loop_step_t step2 = cb_tick_loop_advance(&loop);
+    CHECK(step2.ticks_to_run == 2, "2.5ms -> 2 ticks");
+    CHECK(step2.leftover_ns == 500000ull, "leftover == 500_000 ns");
+    CHECK(loop.sim_tick_index == 7, "sim_tick_index accumulates");
+
+    /* No clock change -> no new ticks. */
+    cb_tick_loop_step_t step3 = cb_tick_loop_advance(&loop);
+    CHECK(step3.ticks_to_run == 0, "zero elapsed -> zero ticks");
+    CHECK(loop.sim_tick_index == 7, "sim_tick_index unchanged");
+
+    printf("  PASS: section 10 manual_clock_advances\n");
+    return 0;
+}
+
+/* ---------- section 11: manual clock survives reset ---------- */
+
+static int section11_manual_clock_survives_reset(void)
+{
+    printf("--- Section 11: manual clock survives reset\n");
+
+    cb_tick_loop_t loop = cb_tick_loop_create(1000, 0);
+    CHECK(loop.info == CB_INFO_OK, "create OK");
+
+    g_manual_clock_ns = 10ull * 1000000ull;
+    cb_tick_loop_set_clock(&loop, manual_clock, NULL);
+
+    (void)cb_tick_loop_advance(&loop);               /* seed baseline */
+    g_manual_clock_ns += 3ull * 1000000ull;
+    cb_tick_loop_step_t pre = cb_tick_loop_advance(&loop);
+    CHECK(pre.ticks_to_run == 3, "pre-reset produced ticks");
+
+    cb_tick_loop_reset(&loop);
+    CHECK(loop.clock_fn == manual_clock, "reset preserves clock_fn");
+
+    /* A first advance post-reset must pick up the manual clock, not the
+     * default, i.e. baseline == current g_manual_clock_ns, not cb_time_now_ns. */
+    uint64_t baseline = g_manual_clock_ns;
+    cb_tick_loop_step_t post0 = cb_tick_loop_advance(&loop);
+    CHECK(post0.ticks_to_run == 0, "post-reset baseline advance yields 0 ticks");
+    CHECK(loop.last_time_ns == baseline,
+          "post-reset last_time_ns seeded from manual clock");
+
+    /* Bump manual clock and verify ticks come out — if reset had dropped the
+     * manual clock back to cb_time_now_ns, last_time_ns would be near
+     * cb_time_now_ns() and a 1ms manual-clock bump would not yield a tick. */
+    g_manual_clock_ns += 4ull * 1000000ull;
+    cb_tick_loop_step_t post1 = cb_tick_loop_advance(&loop);
+    CHECK(post1.ticks_to_run == 4, "post-reset advance uses manual clock");
+
+    printf("  PASS: section 11 manual_clock_survives_reset\n");
+    return 0;
+}
+
+/* ---------- section 12: default clock still works ---------- */
+
+static int section12_default_clock_still_works(void)
+{
+    printf("--- Section 12: default clock still works without set_clock\n");
+
+    /* 1000 Hz loop, no clock injection. */
+    cb_tick_loop_t loop = cb_tick_loop_create(1000, 0);
+    CHECK(loop.info == CB_INFO_OK, "create OK");
+    CHECK(loop.clock_fn == NULL, "default clock_fn is NULL");
+
+    cb_tick_loop_step_t s0 = cb_tick_loop_advance(&loop);
+    CHECK(s0.ticks_to_run == 0, "first advance yields 0 ticks");
+    CHECK(loop.last_time_ns != 0, "last_time_ns seeded from default clock");
+
+    cb_time_sleep_ms(5);
+    cb_tick_loop_step_t s1 = cb_tick_loop_advance(&loop);
+    CHECK(s1.info == CB_INFO_OK, "second advance info OK");
+    CHECK(s1.ticks_to_run >= 3, "at least 3 ticks after ~5ms real sleep");
+    CHECK(loop.sim_tick_index == (uint64_t)s1.ticks_to_run,
+          "sim_tick_index reflects real-time elapsed");
+
+    /* set_clock(NULL) restores the default on a loop that had a manual clock. */
+    g_manual_clock_ns = 100ull * 1000000ull;
+    cb_tick_loop_set_clock(&loop, manual_clock, NULL);
+    CHECK(loop.clock_fn == manual_clock, "manual clock installed");
+    cb_tick_loop_set_clock(&loop, NULL, NULL);
+    CHECK(loop.clock_fn == NULL, "set_clock(NULL) restores default");
+    CHECK(loop.clock_user == NULL, "set_clock(NULL) clears user ptr");
+
+    printf("  PASS: section 12 default_clock_still_works\n");
+    return 0;
+}
+
 /* ---------- main ---------- */
 
 int main(void)
@@ -279,6 +397,9 @@ int main(void)
     if (section7_clamp())          { fails++; }
     if (section8_alpha())          { fails++; }
     if (section9_reset())          { fails++; }
+    if (section10_manual_clock_advances())        { fails++; }
+    if (section11_manual_clock_survives_reset())  { fails++; }
+    if (section12_default_clock_still_works())    { fails++; }
 
     if (fails != 0)
     {

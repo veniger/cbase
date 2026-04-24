@@ -110,6 +110,8 @@ cb_tick_loop_t cb_tick_loop_create(uint32_t tick_hz, uint32_t max_ticks_per_call
     loop.accumulator_ns     = 0;
     loop.sim_tick_index     = 0;
     loop.started            = false;
+    loop.clock_fn           = NULL;
+    loop.clock_user         = NULL;
 
     if (tick_hz == 0)
     {
@@ -120,6 +122,18 @@ cb_tick_loop_t cb_tick_loop_create(uint32_t tick_hz, uint32_t max_ticks_per_call
     return loop;
 }
 
+void cb_tick_loop_set_clock(cb_tick_loop_t *loop, cb_time_clock_fn fn, void *user)
+{
+    if (!loop) return;
+    loop->clock_fn   = fn;                       /* NULL -> fall back to default */
+    loop->clock_user = fn ? user : NULL;
+}
+
+static uint64_t cb__tick_loop_now(const cb_tick_loop_t *loop)
+{
+    return loop->clock_fn ? loop->clock_fn(loop->clock_user) : cb_time_now_ns();
+}
+
 cb_tick_loop_step_t cb_tick_loop_advance(cb_tick_loop_t *loop)
 {
     cb_tick_loop_step_t step;
@@ -128,7 +142,7 @@ cb_tick_loop_step_t cb_tick_loop_advance(cb_tick_loop_t *loop)
     step.first_tick_index = loop->sim_tick_index;
     step.leftover_ns      = 0;
 
-    uint64_t now = cb_time_now_ns();
+    uint64_t now = cb__tick_loop_now(loop);
 
     if (!loop->started)
     {

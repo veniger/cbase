@@ -406,12 +406,18 @@ cb_info_t cb_bytes_read_frame_u16 (cb_bytes_reader_t *r, cb_bytes_reader_t *out_
       stored on loop->info so callers can inspect once at the end.
     - cb_tick_loop_alpha returns the fractional remainder of the accumulator
       in [0, CB_FX16_ONE - 1], useful as a render-side interpolation alpha.
+    - cb_tick_loop_set_clock installs a manual clock (pass NULL fn to restore
+      the default cb_time_now_ns). Mirrors cb_netsim_set_clock so headless
+      replay/regression tests can pin simulated time. The injected clock is
+      preserved across cb_tick_loop_reset.
 */
 
 uint64_t cb_time_now_ns(void);
 uint64_t cb_time_now_us(void);
 uint64_t cb_time_now_ms(void);
 void     cb_time_sleep_ms(uint32_t ms);
+
+typedef uint64_t (*cb_time_clock_fn)(void *user);
 
 typedef struct
 {
@@ -422,6 +428,8 @@ typedef struct
     uint64_t  accumulator_ns;      /* elapsed ns not yet turned into ticks */
     uint64_t  sim_tick_index;      /* total ticks advanced since create/reset */
     bool      started;             /* false until the first advance call */
+    cb_time_clock_fn clock_fn;     /* NULL -> default: cb_time_now_ns */
+    void             *clock_user;
 } cb_tick_loop_t;
 
 typedef struct
@@ -436,6 +444,11 @@ cb_tick_loop_t      cb_tick_loop_create(uint32_t tick_hz, uint32_t max_ticks_per
 cb_tick_loop_step_t cb_tick_loop_advance(cb_tick_loop_t *loop);
 cb_fx16_t           cb_tick_loop_alpha(const cb_tick_loop_t *loop);
 void                cb_tick_loop_reset(cb_tick_loop_t *loop);
+
+/* Install a manual clock. Pass NULL fn to restore the default (cb_time_now_ns).
+ * Preserved across cb_tick_loop_reset. */
+void                cb_tick_loop_set_clock(cb_tick_loop_t *loop,
+                                           cb_time_clock_fn fn, void *user);
 
 /* SEG Config */
 
