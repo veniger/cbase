@@ -547,6 +547,55 @@ static int section19_arena_vs_malloc(void)
     return 0;
 }
 
+/* ---------- section 20: triple duplicate keys, last wins, count stays 1 ---------- */
+
+static int section20_triple_duplicate(void)
+{
+    printf("--- Section 20: A=1\\nA=2\\nA=3 collapses to last-wins\n");
+
+    cb_config_t cfg = cfg_parse_lit("A=1\nA=2\nA=3\n");
+    CHECK(cfg.info == CB_INFO_OK, "triple-duplicate parse OK");
+    CHECK(cfg.count == 1, "triple-duplicate collapses to 1 entry");
+    const char *v = cb_config_get(&cfg, "A");
+    CHECK(v != NULL, "A present");
+    CHECK(strcmp(v, "3") == 0, "last-wins gives 3");
+    cb_config_destroy(&cfg);
+
+    printf("  triple-duplicate OK\n");
+    return 0;
+}
+
+/* ---------- section 21: quoted value with trailing garbage rejected ---------- */
+
+static int section21_quoted_trailing_garbage(void)
+{
+    printf("--- Section 21: quoted value trailing garbage -> PARSE_ERROR\n");
+
+    /* `key = \"x\"hello\n` — previously silently accepted as value=\"x\". */
+    cb_config_t cfg = cfg_parse_lit("key = \"x\"hello\n");
+    CHECK(cfg.info == CB_INFO_CONFIG_PARSE_ERROR,
+          "quoted + trailing token must be PARSE_ERROR");
+    cb_config_destroy(&cfg);
+
+    /* Whitespace after the close quote is still fine. */
+    cb_config_t cfg2 = cfg_parse_lit("key = \"x\"   \n");
+    CHECK(cfg2.info == CB_INFO_OK, "trailing whitespace after quoted OK");
+    CHECK(cfg2.count == 1, "one entry");
+    const char *v = cb_config_get(&cfg2, "key");
+    CHECK(v != NULL && strcmp(v, "x") == 0, "value parsed as x");
+    cb_config_destroy(&cfg2);
+
+    /* Comment after the close quote is fine. */
+    cb_config_t cfg3 = cfg_parse_lit("key = \"x\" # trailing comment\n");
+    CHECK(cfg3.info == CB_INFO_OK, "comment after quoted OK");
+    v = cb_config_get(&cfg3, "key");
+    CHECK(v != NULL && strcmp(v, "x") == 0, "value is x");
+    cb_config_destroy(&cfg3);
+
+    printf("  quoted-trailing-garbage OK\n");
+    return 0;
+}
+
 /* ---------- main ---------- */
 
 int main(void)
@@ -574,6 +623,8 @@ int main(void)
     if (section17_roundtrip_file())           { fails++; }
     if (section18_parse_fail_safety())        { fails++; }
     if (section19_arena_vs_malloc())          { fails++; }
+    if (section20_triple_duplicate())         { fails++; }
+    if (section21_quoted_trailing_garbage())  { fails++; }
 
     if (fails != 0) {
         fprintf(stderr, "FAIL: %d section(s) failed\n", fails);

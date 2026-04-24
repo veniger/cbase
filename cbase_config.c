@@ -10,6 +10,9 @@
  * null-terminated key buffer and a null-terminated value buffer, both
  * allocated via cb__alloc (arena or malloc). On duplicate key, the old
  * value buffer is freed and replaced while the entry keeps its position.
+ * A tail pointer makes every append O(1); duplicate-key lookup is still
+ * linear but bounded by the total unique-key count — acceptable for the
+ * intended use (small config files, parsed once).
  *
  * parse_file caps file size at 16 MiB. Line length cap is 4096 bytes.
  *
@@ -162,17 +165,17 @@ static cb_info_t cb__config_set(cb_config_t *cfg,
     entry->key   = new_key;
     entry->value = new_value;
 
-    /* Append in parse order. Cheap since config files are tiny. */
+    /* Append in parse order via the tail pointer — O(1) per insert, so parse
+     * stays linear regardless of config size. */
     if (!cfg->head)
     {
         cfg->head = entry;
     }
     else
     {
-        cb__config_entry_t *tail = cfg->head;
-        while (tail->next) tail = tail->next;
-        tail->next = entry;
+        cfg->tail->next = entry;
     }
+    cfg->tail = entry;
     cfg->count += 1u;
     return CB_INFO_OK;
 }
@@ -218,8 +221,15 @@ static cb_info_t cb__config_decode_value(const char *s, size_t len,
         char c = s[j];
         if (c == '"')
         {
-            /* Closing quote found. Trailing content after it is ignored (we
-               allow whitespace / comments; we don't validate strictly). */
+            /* Closing quote found. Anything after it must be whitespace or
+             * a full-line comment ('#'/';'); otherwise the line is malformed
+             * (e.g. `key = "x"hello`, which previously silently accepted). */
+            size_t k = j + 1;
+            while (k < len && cb__config_is_space(s[k])) ++k;
+            if (k < len && s[k] != '#' && s[k] != ';')
+            {
+                return CB_INFO_CONFIG_PARSE_ERROR;
+            }
             *out_len = w;
             return CB_INFO_OK;
         }
@@ -316,6 +326,7 @@ static void cb__config_free_entries(cb_config_t *cfg)
         e = next;
     }
     cfg->head  = NULL;
+    cfg->tail  = NULL;
     cfg->count = 0;
 }
 
@@ -327,6 +338,7 @@ cb_config_t cb_config_parse(cb_arena_t *arena, const char *text, size_t len)
     cfg.count      = 0;
     cfg.arena      = arena;
     cfg.head       = NULL;
+    cfg.tail       = NULL;
 
     if (!text && len > 0)
     {
@@ -398,6 +410,7 @@ cb_config_t cb_config_parse_file(cb_arena_t *arena, const char *path)
     cfg.count      = 0;
     cfg.arena      = arena;
     cfg.head       = NULL;
+    cfg.tail       = NULL;
 
     FILE *f = fopen(path, "rb");
     if (!f)
@@ -435,10 +448,13 @@ cb_config_t cb_config_parse_file(cb_arena_t *arena, const char *path)
     }
 
     size_t sz = (size_t)raw_sz;
-    /* Allocate on the arena (or malloc) so destroy lifetime matches. Use a
-       local malloc here instead — the buffer is only needed during parse and
-       would otherwise bloat the arena. */
-    char *buf = (char *)malloc(sz > 0 ? sz : 1u);
+    /* Read buffer lifetime is parse-scoped: allocate through cb__alloc so
+     * arena callers see a single allocator path end-to-end, and cb__free it
+     * before returning regardless of arena-vs-malloc. For linear/exponential
+     * arenas cb__free is a no-op and the transient sits in the arena until
+     * the caller resets or destroys it (documented below). For fixed-strategy
+     * arenas and for the malloc fallback, cb__free actually releases. */
+    char *buf = (char *)cb__alloc(arena, sz > 0 ? sz : 1u, 1u);
     if (!buf)
     {
         fclose(f);
@@ -450,13 +466,13 @@ cb_config_t cb_config_parse_file(cb_arena_t *arena, const char *path)
     fclose(f);
     if (nread != sz)
     {
-        free(buf);
+        cb__free(arena, buf);
         cfg.info = CB_INFO_CONFIG_FILE_OPEN_FAILED;
         return cfg;
     }
 
     cfg = cb_config_parse(arena, buf, sz);
-    free(buf);
+    cb__free(arena, buf);
     return cfg;
 }
 

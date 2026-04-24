@@ -507,6 +507,7 @@ typedef struct
     uint32_t            count;            /* number of unique keys */
     cb_arena_t         *arena;            /* nullable; same allocate-on-arena-or-malloc convention */
     cb__config_entry_t *head;             /* opaque linked list; internal */
+    cb__config_entry_t *tail;             /* tail pointer for O(1) append; internal */
 } cb_config_t;
 
 /* Load from a null-terminated text buffer. `len` is the number of bytes to
