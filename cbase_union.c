@@ -10,3 +10,4 @@
 #include "cbase_config.c"
 #include "cbase_log.c"
 #include "cbase_hash.c"
+#include "cbase_netsim.c"

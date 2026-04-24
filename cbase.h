@@ -105,6 +105,14 @@ typedef enum
     CB_INFO_LOG_INVALID_SINK,         /* reserved; sink setter currently accepts any FILE* incl. NULL */
     CB_INFO_LOG_WRITE_FAILED,         /* fwrite returned short; recorded, never retried */
 
+    /* NetSim errors */
+    CB_INFO_NETSIM_DUPLICATE_ADDR,
+    CB_INFO_NETSIM_UNKNOWN_DEST,      /* returned from recv side in edge cases; NOT from send (silent drop) */
+    CB_INFO_NETSIM_EMPTY,
+    CB_INFO_NETSIM_BUF_TOO_SMALL,     /* recv out_cap < datagram len */
+    CB_INFO_NETSIM_ALLOC_FAILED,
+    CB_INFO_NETSIM_BAD_PARAMS,        /* e.g. latency_ms_min > latency_ms_max */
+
 } cb_info_t;
 
 /* SEG Memory / Arena Allocator */
@@ -815,6 +823,149 @@ typedef struct
 } cb_net_pollable_t;
 
 cb_info_t cb_net_poll(cb_net_pollable_t *items, size_t count, int timeout_ms);
+
+/* SEG NetSim */
+
+/*
+ * Deterministic in-process UDP network simulator. Used by tests and by the
+ * explorers protocol harness to exercise lossy / latent / reordering /
+ * duplicating / corrupting links without real sockets.
+ *
+ * Single-threaded. Not for production traffic.
+ *
+ * Each `cb_netsim_t` is a virtual network containing any number of virtual
+ * endpoints identified by `cb_net_addr_t`. Sends from one endpoint enqueue
+ * datagrams onto the network; recv delivers whatever is ready for that
+ * endpoint after impairments are applied.
+ *
+ * Impairment sources of entropy:
+ *   - A PRNG (`cb_rng_t`) seeded at create time. All random decisions
+ *     (drop, dup, reorder, corrupt, latency roll) consume from this stream.
+ *     Same seed + same call sequence = byte-exact deterministic replay.
+ *   - A clock source (`cb_netsim_clock_fn`). Default uses `cb_time_now_ns`,
+ *     but tests can install a manual clock (returning user-controlled values)
+ *     to pin schedule behavior without wall time.
+ *
+ * Segment placement note: conceptually this follows SEG Hash, but the API
+ * references `cb_net_addr_t` from SEG Network, so the declarations live
+ * after SEG Network in this header.
+ */
+
+typedef uint64_t (*cb_netsim_clock_fn)(void *user);
+
+typedef struct
+{
+    /* Per-packet drop probability, Q16.16 in [0, 1]. 0 means never drop. */
+    cb_fx16_t drop_prob;
+
+    /* Per-packet duplicate probability, Q16.16 in [0, 1]. If rolled, the same
+     * datagram is enqueued twice (both subject to further per-copy rolls for
+     * latency/reorder/corruption). */
+    cb_fx16_t dup_prob;
+
+    /* Per-packet corrupt probability, Q16.16 in [0, 1]. On hit, flip one bit
+     * chosen uniformly in the payload. Length is unchanged. */
+    cb_fx16_t corrupt_prob;
+
+    /* Min and max added latency, in milliseconds. Delivery time is
+     * enqueue_time + uniform_int(ms_min, ms_max) * 1_000_000. Set both to 0
+     * for immediate delivery. Values are inclusive. min must be <= max. */
+    uint32_t  latency_ms_min;
+    uint32_t  latency_ms_max;
+
+    /* Per-packet reorder probability. If rolled, the packet's scheduled
+     * delivery time gets an extra "swap-back" offset so it sorts AFTER the
+     * next-newer packet. (Implementation detail: we add an extra random
+     * latency in reorder_swap_ms_min..reorder_swap_ms_max.) */
+    cb_fx16_t reorder_prob;
+    uint32_t  reorder_swap_ms_min;
+    uint32_t  reorder_swap_ms_max;
+
+    /* Max bytes in-flight per endpoint. If exceeded on send, new datagrams
+     * are dropped at enqueue (enqueue-failure is still a form of "drop" from
+     * the caller's perspective, distinct from drop_prob). 0 = unlimited. */
+    uint32_t  max_queue_bytes;
+} cb_netsim_params_t;
+
+typedef struct cb__netsim_pending_t  cb__netsim_pending_t;
+typedef struct cb__netsim_endpoint_t cb__netsim_endpoint_t;
+
+typedef struct
+{
+    cb_info_t              info;
+    cb_arena_t            *arena;
+    cb_rng_t               rng;
+    cb_netsim_params_t     params;
+    cb_netsim_clock_fn     clock_fn;
+    void                  *clock_user;
+    /* endpoint list */
+    cb__netsim_endpoint_t *endpoints;
+    /* global pending-delivery sorted list (insertion-sorted by scheduled_ns) */
+    cb__netsim_pending_t  *pending;
+    uint32_t               stat_enqueued;    /* total enqueue calls */
+    uint32_t               stat_delivered;   /* successfully delivered to recv */
+    uint32_t               stat_dropped;     /* rolled drop */
+    uint32_t               stat_duplicated;  /* rolled dup (each dup counts +1) */
+    uint32_t               stat_corrupted;   /* rolled corrupt */
+    uint32_t               stat_reordered;   /* rolled reorder */
+    uint32_t               stat_queue_full;  /* dropped because queue was full */
+} cb_netsim_t;
+
+/* A handle tests pass around — identifies a virtual endpoint on the net. */
+typedef struct
+{
+    cb_info_t     info;
+    cb_netsim_t  *net;
+    cb_net_addr_t addr;
+} cb_netsim_endpoint_t;
+
+/* Create a sim-net. `seed` seeds the impairment PRNG. Pass NULL arena for
+ * malloc-backed. */
+cb_netsim_t          cb_netsim_create(cb_arena_t *arena, uint64_t seed,
+                                      cb_netsim_params_t params);
+void                 cb_netsim_destroy(cb_netsim_t *net);
+
+/* Update params at any time. Returns CB_INFO_NETSIM_BAD_PARAMS if the
+ * params are malformed (e.g. latency_ms_min > latency_ms_max); in that case
+ * the current params are NOT replaced. */
+cb_info_t            cb_netsim_set_params(cb_netsim_t *net,
+                                          cb_netsim_params_t params);
+
+/* Install a manual clock. Pass NULL fn to restore the default (cb_time_now_ns). */
+void                 cb_netsim_set_clock(cb_netsim_t *net,
+                                         cb_netsim_clock_fn fn, void *user);
+
+/* Bind a virtual endpoint. Addresses must be unique per sim-net. Returns
+ * a handle with info=CB_INFO_NETSIM_DUPLICATE_ADDR on duplicate. */
+cb_netsim_endpoint_t cb_netsim_bind(cb_netsim_t *net, cb_net_addr_t addr);
+void                 cb_netsim_close(cb_netsim_endpoint_t *ep);
+
+/* Enqueue a datagram. Returns immediately. Per-packet impairments roll at
+ * send time (latency + drop + dup + corrupt + reorder) so the pending list
+ * has deterministic scheduled timestamps. Returns CB_INFO_OK even when the
+ * packet was rolled for drop — drops are a sim behavior, not a send-error.
+ * Sends to an unbound address are treated as silent drops and counted in
+ * stat_dropped (real UDP allows this too). */
+cb_info_t            cb_netsim_send_to(cb_netsim_endpoint_t *ep,
+                                       cb_net_addr_t dest,
+                                       const void *buf, size_t len);
+
+/* Drain any pending datagrams whose scheduled delivery time <= now. They
+ * become available to subsequent `recv_from` calls on their destination
+ * endpoint. Returns the number of datagrams moved from pending to ready. */
+uint32_t             cb_netsim_step(cb_netsim_t *net);
+
+/* Receive one pending datagram for this endpoint. Returns CB_INFO_NETSIM_EMPTY
+ * if none ready. On success writes the src addr and payload, and returns the
+ * byte count via *out_len (must be non-NULL). Returns CB_INFO_NETSIM_BUF_TOO_SMALL
+ * if out_cap < datagram len; the datagram remains at the head of the queue. */
+cb_info_t            cb_netsim_recv_from(cb_netsim_endpoint_t *ep,
+                                         cb_net_addr_t *out_src,
+                                         void *out_buf, size_t out_cap,
+                                         size_t *out_len);
+
+/* Drops all pending and ready datagrams on the whole net. Stats preserved. */
+void                 cb_netsim_flush(cb_netsim_t *net);
 
 /* SEG IO */
 
