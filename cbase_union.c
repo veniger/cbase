@@ -9,3 +9,4 @@
 #include "cbase_time.c"
 #include "cbase_config.c"
 #include "cbase_log.c"
+#include "cbase_hash.c"

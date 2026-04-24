@@ -575,6 +575,43 @@ cb_info_t      cb_log_set_file_sink(FILE *f);
 
 void           cb_log(cb_log_level_t level, const char *module, const char *fmt, ...);
 
+/* SEG Hash */
+
+/*
+    SHA-256 (FIPS 180-4). Streaming API + one-shot convenience. No
+    allocations. Not a keyed MAC — use HMAC atop this when we add it.
+
+    Zero-length input is valid: cb_sha256(NULL, 0, out) and
+    cb_sha256("", 0, out) both produce the canonical empty-message digest
+    (e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855).
+    For any non-zero len, input must be non-NULL.
+
+    Byte order: the spec output is big-endian; the implementation uses
+    explicit shifts and is host-byte-order independent.
+
+    The incremental ctx is "spent" after cb_sha256_final; re-init before
+    reuse. Repeated final on the same ctx without init is unsupported.
+*/
+
+#define CB_SHA256_DIGEST_LEN 32   /* bytes */
+#define CB_SHA256_BLOCK_LEN  64   /* bytes, SHA-256 message block */
+
+typedef struct
+{
+    uint32_t state[8];     /* H0..H7 working state */
+    uint64_t total_bits;   /* total number of bits consumed (for padding) */
+    uint8_t  buffer[CB_SHA256_BLOCK_LEN];
+    size_t   buffer_len;   /* bytes currently in buffer */
+} cb_sha256_ctx_t;
+
+/* One-shot: compute sha256(input) into the 32-byte out buffer. */
+void cb_sha256(const void *input, size_t len, uint8_t out[CB_SHA256_DIGEST_LEN]);
+
+/* Incremental: init/update/final pattern for streamed input. */
+void cb_sha256_init  (cb_sha256_ctx_t *ctx);
+void cb_sha256_update(cb_sha256_ctx_t *ctx, const void *data, size_t len);
+void cb_sha256_final (cb_sha256_ctx_t *ctx, uint8_t out[CB_SHA256_DIGEST_LEN]);
+
 /* SEG System Stuff */
 
 /* SEG Threading */
