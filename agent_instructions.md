@@ -54,6 +54,25 @@ cbase is a cross-platform (Windows, Linux, macOS) single-file C99 utility librar
   - POSIX: pthreads
   - Windows: Win32 threads, CRITICAL_SECTION, CONDITION_VARIABLE
   - Thread create/join use a heap-allocated trampoline arg (via `cb__alloc`) that holds fn, arg, and result; freed on join. On detach, the trampoline leaks (reclaimed by arena destroy if using an arena)
+- **Random** (`cbase_random.c`): deterministic seeded PRNG for the sim. Algorithm is PCG32 (O'Neill) with canonical pcg-c "srandom" init so the reference vector for (seed=42, stream=54) matches the published demo output. Stream selector lets you run independent streams per zone/module without draw reordering desyncing another.
+  - API covers raw u32/u64, unbiased bounded ints (Lemire's nearly-divisionless), i32 range, fx16 unit/range, BRAD, bool, chance(p in Q16.16), and in-place Fisher-Yates shuffle (stride cap = `CB_RNG_SHUFFLE_MAX_STRIDE` = 256, `CB_INFO_RNG_BAD_STRIDE` on overflow).
+  - No floats, no libm. No global state. `cb_rng_seed` always succeeds.
+  - UBSan traps to watch: the LCG step wraps mod-2^64 by design (`cb__pcg_step` is marked `no_sanitize("unsigned-integer-overflow")`); the XSH-RR rotate widens the left shift to u64 before narrowing; `i32_range` computes span in signed int64 to avoid wrap traps on `(uint32_t)hi - (uint32_t)lo`.
+  - Section 7 of `test_apps/random_test.c` is the cross-platform determinism canary, same pattern as the fixed-point canary (pinned to `0x5655FF65` on macOS arm64). If it fails on a new arch, suspect the PCG32 step or the Lemire threshold first.
+- **Fixed-Point Math** (`cbase_fixed.c`): deterministic math primitives for game simulation. Three types: `cb_fx16_t` (Q16.16 in int32), `cb_fx32_t` (Q32.32 in int64), `cb_brad_t` (binary radians, uint16, wraps at 65536 = full turn).
+  - No floats in the sim path. `cb_fx*_from_float` / `_to_float` / `_to_double` are tooling-only.
+  - No libm, no `<math.h>`. sin/cos use a 1025-entry quarter-turn LUT with linear interpolation; atan2 uses a 257-entry octant LUT; sqrt is digit-by-digit integer (bit-exact).
+  - Saturating arithmetic on overflow (sign-correct to MIN/MAX). Division by zero returns MAX or MIN per dividend sign; `div(0,0) = 0`. `abs(MIN) = MAX`. sqrt of negative = 0. atan2(0,0) = 0.
+  - Q32.32 `mul`/`div`/`sqrt` use `__int128` on GCC/Clang, `_mul128`/`_udiv128` on MSVC. 64-bit targets only on Windows.
+  - Section 6 of `test_apps/fixed_test.c` is a pinned 10000-iteration accumulator that acts as a cross-platform determinism canary. If it fails on a new arch, investigate before anything else (most likely suspect: `cb_fx32_mul` rounding direction on the MSVC path).
+- **Network** (`cbase_network.c`): cross-platform UDP + TCP transport. Raw byte transport only — no framing, no tag, no reliability. Callers layer `[tag][struct bytes]` or whatever they need on top.
+  - POSIX: BSD sockets + `poll()`; `cb_net_init` installs `SIG_IGN` for `SIGPIPE`
+  - Windows: Winsock2 + `WSAPoll` (Vista+); `cb_net_init` calls `WSAStartup(2.2)`
+  - All sockets are non-blocking after creation. I/O functions return `CB_INFO_NET_WOULD_BLOCK` when no data is ready, `CB_INFO_NET_CLOSED` when the peer hangs up (TCP)
+  - `cb_net_addr_t` stores IP and port in **host byte order** for ergonomic comparisons; `htons`/`htonl` conversion happens at the BSD socket boundary only
+  - `cb_tcp_connect` is blocking; `cb_tcp_accept` is non-blocking (listener is set non-blocking at listen time)
+  - `cb_net_poll` wraps `poll` / `WSAPoll` over an array of `cb_net_pollable_t`
+  - On Windows, link `-lws2_32` (the Makefile adds this automatically)
 
 ### File Layout
 ```
@@ -61,6 +80,9 @@ cbase.h              - Public header (all types + declarations)
 cbase_union.c        - Single translation unit (includes all .c files)
 cbase_arena.c        - Arena allocator implementation
 cbase_threading.c    - Threading implementation (POSIX + Win32)
+cbase_network.c      - UDP/TCP transport (POSIX BSD sockets + Win32 Winsock2)
+cbase_fixed.c        - Deterministic fixed-point math (Q16.16, Q32.32, BRAD)
+cbase_random.c       - PCG32 deterministic PRNG (u32/u64, bounded, fx16, BRAD, shuffle)
 test_apps/           - Test programs (one .c file each)
 build/               - Compiled test binaries (gitignored)
 Makefile             - Build system (cross-platform)

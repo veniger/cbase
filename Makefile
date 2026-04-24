@@ -23,6 +23,9 @@ endif
 ifeq ($(UNAME_S),Darwin)
 LDFLAGS += -lpthread -lm
 endif
+ifeq ($(UNAME_S),Windows)
+LDFLAGS += -lws2_32
+endif
 
 SRC      = cbase_union.c
 TEST_DIR = test_apps

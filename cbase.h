@@ -62,6 +62,24 @@ typedef enum
     CB_INFO_ALLOC_FAILED,
     CB_INFO_ARENA_OUT_OF_MEMORY,
 
+    /* Network errors */
+    CB_INFO_NET_INIT_FAILED,
+    CB_INFO_NET_WOULD_BLOCK,
+    CB_INFO_NET_ADDR_INVALID,
+    CB_INFO_NET_SOCKET_FAILED,
+    CB_INFO_NET_BIND_FAILED,
+    CB_INFO_NET_LISTEN_FAILED,
+    CB_INFO_NET_ACCEPT_FAILED,
+    CB_INFO_NET_CONNECT_FAILED,
+    CB_INFO_NET_SEND_FAILED,
+    CB_INFO_NET_RECV_FAILED,
+    CB_INFO_NET_CLOSED,
+    CB_INFO_NET_POLL_FAILED,
+    CB_INFO_NET_NONBLOCK_FAILED,
+
+    /* Random errors */
+    CB_INFO_RNG_BAD_STRIDE,
+
 } cb_info_t;
 
 /* SEG Memory / Arena Allocator */
@@ -101,6 +119,145 @@ void *cb__alloc(cb_arena_t *arena, size_t size, size_t align);
 void  cb__free(cb_arena_t *arena, void *ptr);
 
 /* SEG Math */
+
+/* SEG Fixed-Point Math */
+
+/*
+    Deterministic fixed-point math for games/physics.
+    - cb_fx16_t: Q16.16 signed (int32 backing). Range ~ [-32768, +32768).
+    - cb_fx32_t: Q32.32 signed (int64 backing). Range ~ [-2^31, +2^31).
+    - cb_brad_t: binary radians, uint16. 65536 brad = full turn, wraps naturally.
+
+    All arithmetic saturates on overflow. Division by zero saturates
+    sign-correct (0/0 -> 0 by convention). sqrt of negative -> 0.
+    atan2(0,0) -> 0.
+
+    sin/cos/sqrt/atan2 are LUT-backed and bit-exact deterministic across
+    platforms. The float/double conversion helpers are the ONLY source of
+    floating-point math in this module and are tooling-only (do not use
+    them in simulation paths).
+*/
+
+typedef int32_t  cb_fx16_t;
+typedef int64_t  cb_fx32_t;
+typedef uint16_t cb_brad_t;
+
+#define CB_FX16_ONE     ((cb_fx16_t)65536)
+#define CB_FX16_HALF    ((cb_fx16_t)32768)
+#define CB_FX16_MAX     ((cb_fx16_t)INT32_MAX)
+#define CB_FX16_MIN     ((cb_fx16_t)INT32_MIN)
+#define CB_FX32_ONE     ((cb_fx32_t)(INT64_C(1) << 32))
+#define CB_FX32_MAX     ((cb_fx32_t)INT64_MAX)
+#define CB_FX32_MIN     ((cb_fx32_t)INT64_MIN)
+#define CB_BRAD_FULL    ((cb_brad_t)0)
+#define CB_BRAD_HALF    ((cb_brad_t)32768)
+#define CB_BRAD_QUARTER ((cb_brad_t)16384)
+
+/* --- Q16.16 --- */
+
+cb_fx16_t cb_fx16_from_int(int32_t v);
+int32_t   cb_fx16_to_int(cb_fx16_t v);
+cb_fx16_t cb_fx16_from_float(float v);
+float     cb_fx16_to_float(cb_fx16_t v);
+
+cb_fx16_t cb_fx16_add(cb_fx16_t a, cb_fx16_t b);
+cb_fx16_t cb_fx16_sub(cb_fx16_t a, cb_fx16_t b);
+cb_fx16_t cb_fx16_mul(cb_fx16_t a, cb_fx16_t b);
+cb_fx16_t cb_fx16_div(cb_fx16_t a, cb_fx16_t b);
+cb_fx16_t cb_fx16_abs(cb_fx16_t v);
+cb_fx16_t cb_fx16_min(cb_fx16_t a, cb_fx16_t b);
+cb_fx16_t cb_fx16_max(cb_fx16_t a, cb_fx16_t b);
+cb_fx16_t cb_fx16_clamp(cb_fx16_t v, cb_fx16_t lo, cb_fx16_t hi);
+cb_fx16_t cb_fx16_lerp(cb_fx16_t a, cb_fx16_t b, cb_fx16_t t);
+cb_fx16_t cb_fx16_sqrt(cb_fx16_t v);
+
+cb_fx16_t cb_fx16_sin(cb_brad_t angle);
+cb_fx16_t cb_fx16_cos(cb_brad_t angle);
+cb_brad_t cb_fx16_atan2(cb_fx16_t y, cb_fx16_t x);
+
+/* --- Q32.32 --- */
+
+cb_fx32_t cb_fx32_from_int(int64_t v);
+int64_t   cb_fx32_to_int(cb_fx32_t v);
+cb_fx32_t cb_fx32_from_float(double v);
+double    cb_fx32_to_double(cb_fx32_t v);
+
+cb_fx32_t cb_fx32_add(cb_fx32_t a, cb_fx32_t b);
+cb_fx32_t cb_fx32_sub(cb_fx32_t a, cb_fx32_t b);
+cb_fx32_t cb_fx32_mul(cb_fx32_t a, cb_fx32_t b);
+cb_fx32_t cb_fx32_div(cb_fx32_t a, cb_fx32_t b);
+cb_fx32_t cb_fx32_abs(cb_fx32_t v);
+cb_fx32_t cb_fx32_sqrt(cb_fx32_t v);
+
+cb_fx32_t cb_fx32_from_fx16(cb_fx16_t v);
+cb_fx16_t cb_fx16_from_fx32(cb_fx32_t v);
+
+/* SEG Random */
+
+/*
+    Deterministic seeded PRNG for the 2D extraction game sim.
+
+    Algorithm: PCG32 (O'Neill, 2014). 64-bit LCG state driven by a
+    per-stream odd increment, with an XSH-RR output permutation on the
+    top bits. Output is 32-bit per step.
+
+    Contract:
+    - All sim randomness flows through cb_rng_*.
+    - Identical (seed, stream) pair produces bit-identical output on
+      every supported target (Windows / Linux / macOS, x86_64 / ARM64).
+    - No floats, no libm, no global state.
+    - cb_rng_seed ALWAYS succeeds; info = CB_INFO_OK.
+    - Shuffle is the only operation that can fail (CB_INFO_RNG_BAD_STRIDE
+      when the element stride exceeds the internal scratch cap).
+
+    Stream selector:
+    - The second argument to cb_rng_seed picks an independent stream in
+      the PCG32 stream family. Use it to give each logical source of
+      randomness its own sequence (per-zone, per-match-module, replay
+      slot), so reordering draws in one stream cannot desynchronize
+      another.
+*/
+
+typedef struct
+{
+    cb_info_t info;
+    uint64_t  state;
+    uint64_t  inc;    /* must be odd; lowest bit is forced to 1 by cb_rng_seed */
+} cb_rng_t;
+
+/* Maximum per-element stride supported by cb_rng_shuffle's stack scratch.
+   Shuffling an array whose stride exceeds this flags CB_INFO_RNG_BAD_STRIDE
+   and leaves the array untouched. */
+#define CB_RNG_SHUFFLE_MAX_STRIDE ((size_t)256)
+
+/* --- Core --- */
+
+cb_rng_t  cb_rng_seed(uint64_t seed, uint64_t stream);
+uint32_t  cb_rng_u32(cb_rng_t *rng);
+uint64_t  cb_rng_u64(cb_rng_t *rng);          /* (high u32, low u32) in draw order */
+
+/* --- Bounded integers (unbiased) --- */
+
+uint32_t  cb_rng_u32_below(cb_rng_t *rng, uint32_t bound);      /* [0, bound). bound==0 -> 0, no state advance. */
+int32_t   cb_rng_i32_range(cb_rng_t *rng, int32_t lo, int32_t hi_inclusive); /* [lo, hi]. hi<lo -> lo. */
+
+/* --- Fixed-point & angles (integrate with cb_fixed) --- */
+
+cb_fx16_t cb_rng_fx16_unit(cb_rng_t *rng);                       /* [0, CB_FX16_ONE) */
+cb_fx16_t cb_rng_fx16_range(cb_rng_t *rng, cb_fx16_t lo, cb_fx16_t hi); /* [lo, hi). hi<=lo -> lo. */
+cb_brad_t cb_rng_brad(cb_rng_t *rng);                            /* uniform over full turn */
+
+/* --- Bool / chance --- */
+
+bool      cb_rng_bool(cb_rng_t *rng);
+bool      cb_rng_chance_fx16(cb_rng_t *rng, cb_fx16_t probability); /* p<=0 -> false, p>=ONE -> true */
+
+/* --- Shuffle (Fisher-Yates, in place, deterministic) --- */
+
+/* Uses a stride-sized scratch buffer on the stack (cap = CB_RNG_SHUFFLE_MAX_STRIDE).
+   If stride > cap, sets rng->info = CB_INFO_RNG_BAD_STRIDE and returns without
+   touching the array. n <= 1 is a no-op. */
+void      cb_rng_shuffle(cb_rng_t *rng, void *base, size_t n, size_t stride);
 
 /* SEG System Stuff */
 
@@ -204,6 +361,107 @@ cb_info_t           cb_tsqueue_push(cb_tsqueue_t *queue, void *item);
 cb_tsqueue_item_t   cb_tsqueue_pop(cb_tsqueue_t *queue);
 cb_tsqueue_item_t   cb_tsqueue_try_pop(cb_tsqueue_t *queue);
 uint32_t            cb_tsqueue_count(cb_tsqueue_t *queue);
+
+/* SEG Network */
+
+#ifdef CB_PLATFORM_WINDOWS
+    /* winsock2.h must be included before windows.h was pulled in above;
+       WIN32_LEAN_AND_MEAN (set in the threading section) prevents windows.h
+       from including the legacy winsock.h, so order is safe. */
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    typedef SOCKET cb__sockfd_t;
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    typedef int cb__sockfd_t;
+#endif
+
+/* --- Address (IPv4, host-byte-order fields) --- */
+
+typedef struct
+{
+    cb_info_t info;
+    uint32_t  ip;    /* host byte order: 127.0.0.1 == 0x7F000001 */
+    uint16_t  port;  /* host byte order */
+} cb_net_addr_t;
+
+cb_net_addr_t cb_net_addr_v4(const char *ip_dotted, uint16_t port);
+
+/* --- Lifecycle --- */
+
+cb_info_t cb_net_init(void);      /* WSAStartup on Windows, no-op on POSIX */
+cb_info_t cb_net_shutdown(void);
+
+/* --- Shared result types --- */
+
+typedef struct
+{
+    cb_info_t info;   /* OK / WOULD_BLOCK / CLOSED / SEND_FAILED / RECV_FAILED */
+    size_t    bytes;  /* bytes sent or received */
+} cb_net_io_result_t;
+
+/* --- UDP (connectionless datagrams) --- */
+
+typedef struct
+{
+    cb_info_t     info;
+    cb__sockfd_t  handle;
+} cb_udp_socket_t;
+
+typedef struct
+{
+    cb_info_t     info;
+    cb_net_addr_t from;
+    size_t        size;  /* bytes written to user buf */
+} cb_udp_recv_result_t;
+
+cb_udp_socket_t      cb_udp_open(uint16_t bind_port);   /* 0 = any/ephemeral */
+cb_info_t            cb_udp_close(cb_udp_socket_t *s);
+cb_net_io_result_t   cb_udp_send(cb_udp_socket_t *s, cb_net_addr_t to,
+                                 const void *data, size_t size);
+cb_udp_recv_result_t cb_udp_recv(cb_udp_socket_t *s, void *buf, size_t buf_size);
+
+/* --- TCP (byte stream) --- */
+
+typedef struct
+{
+    cb_info_t     info;
+    cb__sockfd_t  handle;
+} cb_tcp_socket_t;
+
+typedef struct
+{
+    cb_info_t     info;
+    cb__sockfd_t  handle;
+} cb_tcp_listener_t;
+
+cb_tcp_listener_t  cb_tcp_listen(uint16_t port, int backlog);
+cb_info_t          cb_tcp_listener_close(cb_tcp_listener_t *l);
+cb_tcp_socket_t    cb_tcp_accept(cb_tcp_listener_t *l);   /* non-blocking */
+cb_tcp_socket_t    cb_tcp_connect(cb_net_addr_t to);      /* blocks until connected; non-blocking thereafter */
+cb_info_t          cb_tcp_close(cb_tcp_socket_t *s);
+cb_net_io_result_t cb_tcp_send(cb_tcp_socket_t *s, const void *data, size_t size);
+cb_net_io_result_t cb_tcp_recv(cb_tcp_socket_t *s, void *buf, size_t buf_size);
+
+/* --- Polling (wait for any of N sockets to be ready) --- */
+
+typedef enum
+{
+    CB_NET_POLL_READ  = 1 << 0,
+    CB_NET_POLL_WRITE = 1 << 1,
+    CB_NET_POLL_ERROR = 1 << 2,
+} cb_net_poll_flags_t;
+
+typedef struct
+{
+    cb__sockfd_t handle;
+    int          events;   /* requested CB_NET_POLL_* bits */
+    int          revents;  /* returned CB_NET_POLL_* bits */
+} cb_net_pollable_t;
+
+cb_info_t cb_net_poll(cb_net_pollable_t *items, size_t count, int timeout_ms);
 
 /* SEG IO */
 
