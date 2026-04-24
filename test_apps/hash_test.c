@@ -437,6 +437,46 @@ static int section11_fuzz(void)
     return 0;
 }
 
+/* ---------- section 17: length-boundary sweep ---------- */
+
+/* For each length n in 0..200, compute the SHA-256 of a deterministic n-byte
+ * input two ways — one-shot, and streamed with a split at every intermediate
+ * byte k in 1..n-1 — and require identical digests. Exercises the 64-byte
+ * block boundary, the padding branch where buffer_len > 56, and short trailing
+ * compressions, all in the same sweep. */
+static int section17_length_boundary_sweep(void)
+{
+    printf("--- Section 17: length-boundary sweep (0..200 bytes)\n");
+
+    uint8_t msg[200];
+    for (int i = 0; i < 200; ++i) {
+        msg[i] = (uint8_t)((i * 53 + 7) & 0xFFu);
+    }
+
+    for (int n = 0; n <= 200; ++n) {
+        uint8_t want[CB_SHA256_DIGEST_LEN];
+        cb_sha256(msg, (size_t)n, want);
+
+        for (int k = 0; k <= n; ++k) {
+            cb_sha256_ctx_t ctx;
+            cb_sha256_init(&ctx);
+            cb_sha256_update(&ctx, msg, (size_t)k);
+            cb_sha256_update(&ctx, msg + k, (size_t)(n - k));
+            uint8_t got[CB_SHA256_DIGEST_LEN];
+            cb_sha256_final(&ctx, got);
+            if (!digest_eq(got, want)) {
+                fprintf(stderr, "FAIL: n=%d k=%d\n", n, k);
+                fail_digest_mismatch("sweep", got, want);
+                printf("FAIL: section 17\n");
+                return 1;
+            }
+        }
+    }
+
+    printf("PASS: section 17 length-boundary sweep\n");
+    return 0;
+}
+
 /* ---------- HMAC-SHA256 helpers + sections 12..16 ---------- */
 
 /* Parse an ascii hex string into bytes. len(hex) must be 2 * out_len. */
@@ -623,6 +663,7 @@ int main(void)
     if (section14_rfc4231_tc3())  fails++;
     if (section15_rfc4231_tc6_long_key()) fails++;
     if (section16_hmac_incremental_vs_oneshot()) fails++;
+    if (section17_length_boundary_sweep()) fails++;
 
     if (fails != 0) {
         fprintf(stderr, "FAIL: %d section(s) failed\n", fails);

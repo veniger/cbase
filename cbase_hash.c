@@ -142,8 +142,12 @@ void cb_sha256_update(cb_sha256_ctx_t *ctx, const void *data, size_t len)
     if (len == 0) return;
     const uint8_t *p = (const uint8_t *)data;
 
-    /* Bit count update. 2^64 bits is well past anything we'd ever hash;
-       wrap is defined on unsigned types anyway. */
+    /* Bit count update. 2^64 bits == 2 exbibytes — a single hash call would
+       need 18 PB of input to wrap, so we do not guard. Wrap is defined on
+       unsigned types, so even adversarial input hits the `(uint64_t)len*8`
+       multiply wrap before total_bits; either way the final output is
+       still a SHA-256 of whatever bytes we actually compressed, it just
+       won't match the FIPS-compliant digest of the logical stream. */
     ctx->total_bits += (uint64_t)len * 8u;
 
     /* Fill partial block from buffer if present. */
@@ -217,10 +221,12 @@ void cb_sha256_final(cb_sha256_ctx_t *ctx, uint8_t out[CB_SHA256_DIGEST_LEN])
         out[i * 4 + 3] = (uint8_t)( ctx->state[i]        & 0xFFu);
     }
 
-    /* Ctx is "spent" after final. Callers should re-init before reuse.
-       Uncomment the next line to defensively wipe state/buffer if that ever
-       matters for keyed constructions (HMAC keys etc.). */
-    /* memset(ctx, 0, sizeof(*ctx)); */
+    /* Wipe the context on final. The output digest is public, but the
+     * working state can contain fragments of adversarial input, and for
+     * keyed constructions (HMAC) we have inner-sha ctx sitting next to
+     * opad key material. Keeping the cost of one 104-byte memset is cheap
+     * compared to the alternative of downstream code remembering to zero. */
+    memset(ctx, 0, sizeof(*ctx));
 }
 
 void cb_sha256(const void *input, size_t len, uint8_t out[CB_SHA256_DIGEST_LEN])
