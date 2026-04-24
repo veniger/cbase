@@ -230,3 +230,82 @@ void cb_sha256(const void *input, size_t len, uint8_t out[CB_SHA256_DIGEST_LEN])
     cb_sha256_update(&ctx, input, len);
     cb_sha256_final(&ctx, out);
 }
+
+/* --- HMAC-SHA256 (RFC 2104 / FIPS 198-1) --- */
+
+#define CB__HMAC_IPAD 0x36u
+#define CB__HMAC_OPAD 0x5Cu
+
+/* Derive a block-sized (64-byte) key per RFC 2104: if key_len > block size,
+ * hash first; otherwise copy and zero-pad. */
+static void cb__hmac_derive_block_key(const void *key, size_t key_len,
+                                      uint8_t out_block[CB_SHA256_BLOCK_LEN])
+{
+    memset(out_block, 0, CB_SHA256_BLOCK_LEN);
+    if (key_len > CB_SHA256_BLOCK_LEN)
+    {
+        cb_sha256(key, key_len, out_block);
+        /* Remaining CB_SHA256_BLOCK_LEN - CB_SHA256_DIGEST_LEN bytes stay 0. */
+    }
+    else if (key_len > 0)
+    {
+        memcpy(out_block, key, key_len);
+    }
+}
+
+void cb_hmac_sha256_init(cb_hmac_sha256_ctx_t *ctx, const void *key, size_t key_len)
+{
+    uint8_t block_key[CB_SHA256_BLOCK_LEN];
+    uint8_t ipad[CB_SHA256_BLOCK_LEN];
+
+    cb__hmac_derive_block_key(key, key_len, block_key);
+
+    /* ipad = block_key XOR 0x36^64, opad = block_key XOR 0x5c^64. */
+    for (size_t i = 0; i < CB_SHA256_BLOCK_LEN; ++i)
+    {
+        ipad[i]                 = (uint8_t)(block_key[i] ^ CB__HMAC_IPAD);
+        ctx->outer_key_pad[i]   = (uint8_t)(block_key[i] ^ CB__HMAC_OPAD);
+    }
+
+    cb_sha256_init(&ctx->inner);
+    cb_sha256_update(&ctx->inner, ipad, CB_SHA256_BLOCK_LEN);
+
+    /* Wipe the derived block key — it is only key material, not secret
+     * output, but no reason to keep it on the stack after this point. */
+    memset(block_key, 0, sizeof(block_key));
+    memset(ipad,      0, sizeof(ipad));
+}
+
+void cb_hmac_sha256_update(cb_hmac_sha256_ctx_t *ctx, const void *data, size_t len)
+{
+    cb_sha256_update(&ctx->inner, data, len);
+}
+
+void cb_hmac_sha256_final(cb_hmac_sha256_ctx_t *ctx,
+                          uint8_t out[CB_HMAC_SHA256_DIGEST_LEN])
+{
+    uint8_t inner_digest[CB_SHA256_DIGEST_LEN];
+    cb_sha256_final(&ctx->inner, inner_digest);
+
+    cb_sha256_ctx_t outer;
+    cb_sha256_init(&outer);
+    cb_sha256_update(&outer, ctx->outer_key_pad, CB_SHA256_BLOCK_LEN);
+    cb_sha256_update(&outer, inner_digest,       CB_SHA256_DIGEST_LEN);
+    cb_sha256_final(&outer, out);
+
+    /* Scrub per-run key material. The inner sha ctx is already spent, but
+     * the prepared opad is still sitting in ctx — clear the whole struct so
+     * re-init is the only supported way to reuse. */
+    memset(inner_digest, 0, sizeof(inner_digest));
+    memset(ctx,          0, sizeof(*ctx));
+}
+
+void cb_hmac_sha256(const void *key, size_t key_len,
+                    const void *msg, size_t msg_len,
+                    uint8_t out[CB_HMAC_SHA256_DIGEST_LEN])
+{
+    cb_hmac_sha256_ctx_t ctx;
+    cb_hmac_sha256_init(&ctx, key, key_len);
+    cb_hmac_sha256_update(&ctx, msg, msg_len);
+    cb_hmac_sha256_final(&ctx, out);
+}

@@ -634,6 +634,33 @@ void cb_sha256_init  (cb_sha256_ctx_t *ctx);
 void cb_sha256_update(cb_sha256_ctx_t *ctx, const void *data, size_t len);
 void cb_sha256_final (cb_sha256_ctx_t *ctx, uint8_t out[CB_SHA256_DIGEST_LEN]);
 
+/*
+    HMAC-SHA256 (RFC 2104 / FIPS 198-1), layered on cb_sha256. No allocations.
+
+    Keys longer than SHA-256's block size (64 bytes) are hashed down to 32
+    bytes per the spec. Shorter keys are zero-padded to the block size. Both
+    one-shot and streaming variants are provided; the streaming ctx keeps the
+    inner SHA state plus the prepared opad for the final step.
+*/
+
+#define CB_HMAC_SHA256_DIGEST_LEN CB_SHA256_DIGEST_LEN
+
+/* One-shot HMAC-SHA256. */
+void cb_hmac_sha256(const void *key, size_t key_len,
+                    const void *msg, size_t msg_len,
+                    uint8_t out[CB_HMAC_SHA256_DIGEST_LEN]);
+
+typedef struct
+{
+    cb_sha256_ctx_t inner;
+    uint8_t         outer_key_pad[CB_SHA256_BLOCK_LEN];   /* prepared opad for final step */
+} cb_hmac_sha256_ctx_t;
+
+void cb_hmac_sha256_init  (cb_hmac_sha256_ctx_t *ctx, const void *key, size_t key_len);
+void cb_hmac_sha256_update(cb_hmac_sha256_ctx_t *ctx, const void *data, size_t len);
+void cb_hmac_sha256_final (cb_hmac_sha256_ctx_t *ctx,
+                           uint8_t out[CB_HMAC_SHA256_DIGEST_LEN]);
+
 /* SEG System Stuff */
 
 /* SEG Threading */

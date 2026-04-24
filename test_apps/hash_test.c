@@ -437,6 +437,168 @@ static int section11_fuzz(void)
     return 0;
 }
 
+/* ---------- HMAC-SHA256 helpers + sections 12..16 ---------- */
+
+/* Parse an ascii hex string into bytes. len(hex) must be 2 * out_len. */
+static void hex_decode(const char *hex, uint8_t *out, size_t out_len)
+{
+    for (size_t i = 0; i < out_len; ++i) {
+        char  hi = hex[2 * i];
+        char  lo = hex[2 * i + 1];
+        uint8_t h = (uint8_t)((hi >= 'a') ? (hi - 'a' + 10)
+                            : (hi >= 'A') ? (hi - 'A' + 10)
+                                          : (hi - '0'));
+        uint8_t l = (uint8_t)((lo >= 'a') ? (lo - 'a' + 10)
+                            : (lo >= 'A') ? (lo - 'A' + 10)
+                                          : (lo - '0'));
+        out[i] = (uint8_t)((h << 4) | l);
+    }
+}
+
+static int check_hmac(const char *name,
+                      const uint8_t *key, size_t key_len,
+                      const uint8_t *msg, size_t msg_len,
+                      const char    *want_hex)
+{
+    uint8_t got[CB_HMAC_SHA256_DIGEST_LEN];
+    uint8_t want[CB_HMAC_SHA256_DIGEST_LEN];
+    hex_decode(want_hex, want, CB_HMAC_SHA256_DIGEST_LEN);
+    cb_hmac_sha256(key, key_len, msg, msg_len, got);
+    if (memcmp(got, want, CB_HMAC_SHA256_DIGEST_LEN) != 0) {
+        fail_digest_mismatch(name, got, want);
+        return 1;
+    }
+    return 0;
+}
+
+/* RFC 4231 Test Case 1. */
+static int section12_rfc4231_tc1(void)
+{
+    printf("--- Section 12: HMAC-SHA256 RFC4231 TC1\n");
+    uint8_t key[20];
+    memset(key, 0x0b, sizeof(key));
+    const char *msg = "Hi There";
+    if (check_hmac("RFC4231 TC1", key, sizeof(key),
+                   (const uint8_t *)msg, strlen(msg),
+                   "b0344c61d8db38535ca8afceaf0bf12b"
+                   "881dc200c9833da726e9376c2e32cff7"))
+    {
+        printf("FAIL: section 12\n");
+        return 1;
+    }
+    printf("PASS: section 12 RFC4231 TC1\n");
+    return 0;
+}
+
+/* RFC 4231 Test Case 2 (key shorter than block). */
+static int section13_rfc4231_tc2(void)
+{
+    printf("--- Section 13: HMAC-SHA256 RFC4231 TC2\n");
+    const char *key = "Jefe";
+    const char *msg = "what do ya want for nothing?";
+    if (check_hmac("RFC4231 TC2",
+                   (const uint8_t *)key, strlen(key),
+                   (const uint8_t *)msg, strlen(msg),
+                   "5bdcc146bf60754e6a042426089575c7"
+                   "5a003f089d2739839dec58b964ec3843"))
+    {
+        printf("FAIL: section 13\n");
+        return 1;
+    }
+    printf("PASS: section 13 RFC4231 TC2\n");
+    return 0;
+}
+
+/* RFC 4231 Test Case 3 (key = 20 * 0xaa, data = 50 * 0xdd). */
+static int section14_rfc4231_tc3(void)
+{
+    printf("--- Section 14: HMAC-SHA256 RFC4231 TC3\n");
+    uint8_t key[20];
+    uint8_t data[50];
+    memset(key,  0xaa, sizeof(key));
+    memset(data, 0xdd, sizeof(data));
+    if (check_hmac("RFC4231 TC3", key, sizeof(key),
+                   data, sizeof(data),
+                   "773ea91e36800e46854db8ebd09181a7"
+                   "2959098b3ef8c122d9635514ced565fe"))
+    {
+        printf("FAIL: section 14\n");
+        return 1;
+    }
+    printf("PASS: section 14 RFC4231 TC3\n");
+    return 0;
+}
+
+/* RFC 4231 Test Case 6 (key = 131 * 0xaa, > block size). */
+static int section15_rfc4231_tc6_long_key(void)
+{
+    printf("--- Section 15: HMAC-SHA256 RFC4231 TC6 (long key)\n");
+    uint8_t key[131];
+    memset(key, 0xaa, sizeof(key));
+    const char *msg =
+        "Test Using Larger Than Block-Size Key - Hash Key First";
+    if (check_hmac("RFC4231 TC6", key, sizeof(key),
+                   (const uint8_t *)msg, strlen(msg),
+                   "60e431591ee0b67f0d8a26aacbf5b77f"
+                   "8e0bc6213728c5140546040f0ee37f54"))
+    {
+        printf("FAIL: section 15\n");
+        return 1;
+    }
+    printf("PASS: section 15 RFC4231 TC6 long key\n");
+    return 0;
+}
+
+/* Incremental vs one-shot equivalence on a long message fed in 3 chunks. */
+static int section16_hmac_incremental_vs_oneshot(void)
+{
+    printf("--- Section 16: HMAC incremental == one-shot\n");
+
+    /* 512-byte message with a random-ish pattern. */
+    uint8_t msg[512];
+    for (size_t i = 0; i < sizeof(msg); ++i) {
+        msg[i] = (uint8_t)((i * 131u + 17u) & 0xFFu);
+    }
+    const uint8_t key[32] = {
+        0x00,0x11,0x22,0x33, 0x44,0x55,0x66,0x77,
+        0x88,0x99,0xaa,0xbb, 0xcc,0xdd,0xee,0xff,
+        0xde,0xad,0xbe,0xef, 0xfe,0xed,0xfa,0xce,
+        0xba,0xad,0xf0,0x0d, 0x8b,0xad,0xf0,0x0d,
+    };
+
+    uint8_t want[CB_HMAC_SHA256_DIGEST_LEN];
+    cb_hmac_sha256(key, sizeof(key), msg, sizeof(msg), want);
+
+    /* Split into 3 chunks of unequal size. */
+    const size_t splits[][3] = {
+        {   1, 255, 256 },
+        { 100, 100, 312 },
+        { 511,   0,   1 },
+        {   0, 512,   0 },
+        { 255,   1, 256 },
+    };
+    for (size_t s = 0; s < sizeof(splits) / sizeof(splits[0]); ++s) {
+        cb_hmac_sha256_ctx_t ctx;
+        cb_hmac_sha256_init(&ctx, key, sizeof(key));
+        size_t off = 0;
+        for (int k = 0; k < 3; ++k) {
+            cb_hmac_sha256_update(&ctx, msg + off, splits[s][k]);
+            off += splits[s][k];
+        }
+        uint8_t got[CB_HMAC_SHA256_DIGEST_LEN];
+        cb_hmac_sha256_final(&ctx, got);
+        if (memcmp(got, want, sizeof(got)) != 0) {
+            fprintf(stderr, "FAIL: split[%zu] mismatch\n", s);
+            fail_digest_mismatch("incremental", got, want);
+            printf("FAIL: section 16\n");
+            return 1;
+        }
+    }
+
+    printf("PASS: section 16 incremental==one-shot\n");
+    return 0;
+}
+
 /* ---------- main ---------- */
 
 int main(void)
@@ -456,6 +618,11 @@ int main(void)
     /* section 9: documentation-only, no test. */
     if (section10_byte_order())   fails++;
     if (section11_fuzz())         fails++;
+    if (section12_rfc4231_tc1())  fails++;
+    if (section13_rfc4231_tc2())  fails++;
+    if (section14_rfc4231_tc3())  fails++;
+    if (section15_rfc4231_tc6_long_key()) fails++;
+    if (section16_hmac_incremental_vs_oneshot()) fails++;
 
     if (fails != 0) {
         fprintf(stderr, "FAIL: %d section(s) failed\n", fails);
