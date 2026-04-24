@@ -178,9 +178,12 @@ static int section7_clamp(void)
     cb_tick_loop_t loop = cb_tick_loop_create(60, 5);
     CHECK(loop.info == CB_INFO_OK, "60Hz create OK");
 
-    /* Seed manually: pretend last_time was 1 second ago (~60 ticks of lag). */
+    /* Seed manually: pretend last_time was 1 second ago (~60 ticks of lag).
+     * Guard the subtraction — on a freshly-booted machine the monotonic
+     * clock can still be < 1s, which would underflow u64. */
+    uint64_t now = cb_time_now_ns();
     loop.started      = true;
-    loop.last_time_ns = cb_time_now_ns() - 1000000000ull;
+    loop.last_time_ns = (now > 1000000000ull) ? (now - 1000000000ull) : 0ull;
 
     cb_tick_loop_step_t step = cb_tick_loop_advance(&loop);
     CHECK(step.info == CB_INFO_TIME_TICK_LAG, "clamp must flag TICK_LAG on step");

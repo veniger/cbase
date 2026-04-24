@@ -21,6 +21,7 @@
 
 #ifdef CB_PLATFORM_POSIX
     #include <time.h>
+    #include <errno.h>
 #endif
 
 #ifdef CB_PLATFORM_WINDOWS
@@ -39,8 +40,19 @@ static uint64_t cb__qpc_get_freq(void)
     if (f == 0)
     {
         LARGE_INTEGER li;
-        QueryPerformanceFrequency(&li);
-        f = (uint64_t)li.QuadPart;
+        li.QuadPart = 0;
+        /* QPF's BOOL return should never be FALSE on WinXP+, but if it is we
+         * still get a zero QuadPart. Fall back to 1 so cb_time_now_ns doesn't
+         * divide by zero — the resulting "time" is nonsense but the process
+         * stays alive, which is strictly better than UB. */
+        if (!QueryPerformanceFrequency(&li) || li.QuadPart <= 0)
+        {
+            f = 1u;
+        }
+        else
+        {
+            f = (uint64_t)li.QuadPart;
+        }
         cb__qpc_freq = f; /* benign race: every caller computes the same value */
     }
     return f;
@@ -78,10 +90,13 @@ void cb_time_sleep_ms(uint32_t ms)
     struct timespec req;
     req.tv_sec  = (time_t)(ms / 1000u);
     req.tv_nsec = (long)((ms % 1000u) * 1000000u);
-    /* Loop on EINTR so a signal cannot cut the sleep short. */
+    /* Loop on EINTR so a signal cannot cut the sleep short. Any other errno
+     * (EINVAL on a malformed timespec, etc.) is terminal — break out rather
+     * than spinning forever on a request the kernel will never satisfy. */
     struct timespec rem;
     while (nanosleep(&req, &rem) != 0)
     {
+        if (errno != EINTR) break;
         req = rem;
     }
 }
