@@ -10,6 +10,9 @@
  * subsequent op short-circuits without mutating pos and returns that info.
  * On error, info is assigned AND returned; pos is never advanced on a
  * failed op.
+ *
+ * Bounds checks use `n > cap || pos > cap - n` to avoid unsigned-overflow
+ * traps under `-fsanitize=integer`.
  */
 
 #include <stdint.h>
@@ -223,6 +226,7 @@ cb_info_t cb_bytes_read_bytes(cb_bytes_reader_t *r, void *out, size_t n)
 
 size_t cb_bytes_reader_remaining(const cb_bytes_reader_t *r)
 {
+    if (r->info != CB_INFO_OK) return 0;
     return r->len - r->pos;
 }
 
@@ -230,10 +234,16 @@ size_t cb_bytes_reader_remaining(const cb_bytes_reader_t *r)
 
 cb_info_t cb_bytes_begin_frame_u16(cb_bytes_writer_t *w, size_t *out_mark)
 {
-    if (w->info != CB_INFO_OK) return w->info;
+    if (w->info != CB_INFO_OK) {
+        *out_mark = 0;
+        return w->info;
+    }
     size_t mark = w->pos;
     cb_info_t info = cb_bytes_write_u16_le(w, 0);
-    if (info != CB_INFO_OK) return info;
+    if (info != CB_INFO_OK) {
+        *out_mark = 0;
+        return info;
+    }
     *out_mark = mark;
     return CB_INFO_OK;
 }
@@ -258,11 +268,18 @@ cb_info_t cb_bytes_end_frame_u16(cb_bytes_writer_t *w, size_t mark)
 cb_info_t cb_bytes_read_frame_u16(cb_bytes_reader_t *r, cb_bytes_reader_t *out_sub)
 {
     if (r->info != CB_INFO_OK) return r->info;
+    /* Snapshot pos so we can restore it if the body-bounds check fails
+       after the length prefix has already advanced pos. Preserves the
+       atomicity contract: a failed read never leaves pos advanced. */
+    size_t saved_pos = r->pos;
     uint16_t body_len;
     cb_info_t info = cb_bytes_read_u16_le(r, &body_len);
     if (info != CB_INFO_OK) return info;
     info = cb__bytes_r_check(r, (size_t)body_len);
-    if (info != CB_INFO_OK) return info;
+    if (info != CB_INFO_OK) {
+        r->pos = saved_pos;
+        return info;
+    }
     *out_sub = cb_bytes_reader_init(r->data + r->pos, (size_t)body_len);
     r->pos += (size_t)body_len;
     return CB_INFO_OK;

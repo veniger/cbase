@@ -10,6 +10,11 @@
  *   6. Frame-too-large failure path.
  *   7. Empty frame.
  *   8. Fuzz-ish smoke: 100 random frames through a 1 KB buffer.
+ *   9. read_frame_u16 atomicity on body-bounds failure.
+ *  10. reader_remaining on a poisoned reader.
+ *  11. begin_frame_u16 zeroes *out_mark on error.
+ *  12. Nested frames (outer wraps inner).
+ *  13. Poisoned writer short-circuits a write that would otherwise fit.
  */
 
 #include <stdio.h>
@@ -19,8 +24,6 @@
 #include "../cbase.h"
 
 /* ---------- helpers ---------- */
-
-static int g_fails = 0;
 
 #define CHECK(cond, msg) do {                                              \
     if (!(cond)) {                                                         \
@@ -402,23 +405,177 @@ static int section8_fuzz_smoke(void)
     return 0;
 }
 
+/* ---------- section 9: read_frame_u16 atomicity on body-bounds failure ---------- */
+
+static int section9_read_frame_atomicity(void)
+{
+    printf("--- Section 9: read_frame_u16 atomicity on body failure\n");
+
+    /* Craft a buffer with a length prefix of 10 but only 3 body bytes
+       available (5 bytes total: 2 prefix + 3 body, need 2 + 10). */
+    const uint8_t buf[5] = { 0x0Au, 0x00u, 0x11u, 0x22u, 0x33u };
+    cb_bytes_reader_t r = cb_bytes_reader_init(buf, sizeof(buf));
+
+    size_t pos_before = r.pos;
+    cb_bytes_reader_t sub;
+    cb_info_t info = cb_bytes_read_frame_u16(&r, &sub);
+    CHECK(info == CB_INFO_BYTES_OUT_OF_BOUNDS, "under-sized body must OOB");
+    CHECK(r.info == CB_INFO_BYTES_OUT_OF_BOUNDS, "sticky info set");
+    /* Atomicity: pos must be unchanged — NOT advanced past the length prefix. */
+    CHECK(r.pos == pos_before, "pos must remain unchanged after failed read_frame_u16");
+    CHECK(r.pos == 0, "pos must be 0 (initial) after failed read_frame_u16");
+
+    printf("  read_frame_u16 atomicity OK\n");
+    return 0;
+}
+
+/* ---------- section 10: reader_remaining on poisoned reader ---------- */
+
+static int section10_remaining_poisoned(void)
+{
+    printf("--- Section 10: reader_remaining on poisoned reader\n");
+
+    const uint8_t buf[3] = { 0x11u, 0x22u, 0x33u };
+    cb_bytes_reader_t r = cb_bytes_reader_init(buf, sizeof(buf));
+
+    CHECK(cb_bytes_reader_remaining(&r) == 3, "fresh reader has len remaining");
+
+    uint32_t v;
+    cb_info_t info = cb_bytes_read_u32_le(&r, &v);
+    CHECK(info == CB_INFO_BYTES_OUT_OF_BOUNDS, "u32 on 3-byte buf must OOB");
+    CHECK(r.info == CB_INFO_BYTES_OUT_OF_BOUNDS, "reader poisoned");
+
+    CHECK(cb_bytes_reader_remaining(&r) == 0, "poisoned reader reports 0 remaining");
+
+    printf("  reader_remaining poisoned OK\n");
+    return 0;
+}
+
+/* ---------- section 11: begin_frame_u16 zeroes *out_mark on error ---------- */
+
+static int section11_begin_frame_zero_mark(void)
+{
+    printf("--- Section 11: begin_frame_u16 zeroes *out_mark on error\n");
+
+    /* Writer with cap=1: cannot fit the 2-byte placeholder. */
+    uint8_t buf[1];
+    cb_bytes_writer_t w = cb_bytes_writer_init(buf, sizeof(buf));
+
+    size_t mark = (size_t)SIZE_MAX;
+    cb_info_t info = cb_bytes_begin_frame_u16(&w, &mark);
+    CHECK(info == CB_INFO_BYTES_OUT_OF_BOUNDS, "begin_frame with cap=1 must OOB");
+    CHECK(w.info == CB_INFO_BYTES_OUT_OF_BOUNDS, "writer info stuck OOB");
+    CHECK(mark == 0, "mark must be zeroed after failed begin_frame_u16");
+
+    /* Also exercise the sticky-info short-circuit path. */
+    size_t mark2 = (size_t)SIZE_MAX;
+    info = cb_bytes_begin_frame_u16(&w, &mark2);
+    CHECK(info == CB_INFO_BYTES_OUT_OF_BOUNDS, "sticky short-circuit returns OOB");
+    CHECK(mark2 == 0, "mark must be zeroed on sticky short-circuit");
+
+    printf("  begin_frame_u16 zero-mark OK\n");
+    return 0;
+}
+
+/* ---------- section 12: nested frames ---------- */
+
+static int section12_nested_frames(void)
+{
+    printf("--- Section 12: nested frames\n");
+
+    uint8_t buf[64];
+    cb_bytes_writer_t w = cb_bytes_writer_init(buf, sizeof(buf));
+
+    size_t outer_mark = 0;
+    size_t inner_mark = 0;
+
+    CHECK(cb_bytes_begin_frame_u16(&w, &outer_mark) == CB_INFO_OK, "begin outer");
+    CHECK(cb_bytes_write_u8(&w, 0xAAu) == CB_INFO_OK, "outer u8 pre-inner");
+    CHECK(cb_bytes_begin_frame_u16(&w, &inner_mark) == CB_INFO_OK, "begin inner");
+    CHECK(cb_bytes_write_u16_le(&w, 0x1234u) == CB_INFO_OK, "inner u16");
+    CHECK(cb_bytes_end_frame_u16(&w, inner_mark) == CB_INFO_OK, "end inner");
+    CHECK(cb_bytes_write_u8(&w, 0xBBu) == CB_INFO_OK, "outer u8 post-inner");
+    CHECK(cb_bytes_end_frame_u16(&w, outer_mark) == CB_INFO_OK, "end outer");
+    CHECK(w.info == CB_INFO_OK, "writer OK after nested frames");
+
+    /* Decode. */
+    cb_bytes_reader_t r = cb_bytes_reader_init(buf, cb_bytes_writer_len(&w));
+    cb_bytes_reader_t outer_sub;
+    CHECK(cb_bytes_read_frame_u16(&r, &outer_sub) == CB_INFO_OK, "read outer frame");
+
+    uint8_t b;
+    CHECK(cb_bytes_read_u8(&outer_sub, &b) == CB_INFO_OK, "outer sub: read u8 (pre)");
+    CHECK(b == 0xAAu, "outer pre sentinel");
+
+    cb_bytes_reader_t inner_sub;
+    CHECK(cb_bytes_read_frame_u16(&outer_sub, &inner_sub) == CB_INFO_OK, "read inner frame");
+
+    uint16_t s;
+    CHECK(cb_bytes_read_u16_le(&inner_sub, &s) == CB_INFO_OK, "inner sub: read u16");
+    CHECK(s == 0x1234u, "inner u16 value");
+    CHECK(cb_bytes_reader_remaining(&inner_sub) == 0, "inner sub consumed");
+
+    CHECK(cb_bytes_read_u8(&outer_sub, &b) == CB_INFO_OK, "outer sub: read u8 (post)");
+    CHECK(b == 0xBBu, "outer post sentinel");
+    CHECK(cb_bytes_reader_remaining(&outer_sub) == 0, "outer sub consumed");
+    CHECK(cb_bytes_reader_remaining(&r) == 0, "outer reader consumed");
+
+    printf("  nested frames OK\n");
+    return 0;
+}
+
+/* ---------- section 13: poisoned writer short-circuits a would-fit write ---------- */
+
+static int section13_poisoned_writer_short_circuit(void)
+{
+    printf("--- Section 13: poisoned writer short-circuits\n");
+
+    uint8_t buf[4];
+    cb_bytes_writer_t w = cb_bytes_writer_init(buf, sizeof(buf));
+
+    CHECK(cb_bytes_write_u8(&w, 0xCCu) == CB_INFO_OK, "write u8 succeeds");
+    CHECK(w.pos == 1, "pos == 1 after u8");
+    CHECK(w.info == CB_INFO_OK, "info OK after u8");
+
+    /* u32 would need 4 bytes but only 3 remain — must OOB, pos stuck at 1. */
+    cb_info_t info = cb_bytes_write_u32_le(&w, 0xDEADBEEFu);
+    CHECK(info == CB_INFO_BYTES_OUT_OF_BOUNDS, "u32 past cap must OOB");
+    CHECK(w.info == CB_INFO_BYTES_OUT_OF_BOUNDS, "sticky info OOB");
+    CHECK(w.pos == 1, "pos unchanged after failed u32");
+
+    /* A u8 would fit (3 bytes remain) but sticky info must short-circuit. */
+    info = cb_bytes_write_u8(&w, 0xFFu);
+    CHECK(info == CB_INFO_BYTES_OUT_OF_BOUNDS, "sticky short-circuit on would-fit u8");
+    CHECK(w.pos == 1, "pos still 1 after sticky short-circuit");
+
+    printf("  poisoned writer short-circuit OK\n");
+    return 0;
+}
+
 /* ---------- main ---------- */
 
 int main(void)
 {
     printf("=== cb_bytes tests ===\n");
 
-    if (section1_primitives())       { g_fails++; }
-    if (section2_endianness())       { g_fails++; }
-    if (section3_writer_bounds())    { g_fails++; }
-    if (section4_reader_bounds())    { g_fails++; }
-    if (section5_frame_roundtrip())  { g_fails++; }
-    if (section6_frame_too_large())  { g_fails++; }
-    if (section7_empty_frame())      { g_fails++; }
-    if (section8_fuzz_smoke())       { g_fails++; }
+    int fails = 0;
 
-    if (g_fails != 0) {
-        fprintf(stderr, "FAIL: %d section(s) failed\n", g_fails);
+    if (section1_primitives())                       { fails++; }
+    if (section2_endianness())                       { fails++; }
+    if (section3_writer_bounds())                    { fails++; }
+    if (section4_reader_bounds())                    { fails++; }
+    if (section5_frame_roundtrip())                  { fails++; }
+    if (section6_frame_too_large())                  { fails++; }
+    if (section7_empty_frame())                      { fails++; }
+    if (section8_fuzz_smoke())                       { fails++; }
+    if (section9_read_frame_atomicity())             { fails++; }
+    if (section10_remaining_poisoned())              { fails++; }
+    if (section11_begin_frame_zero_mark())           { fails++; }
+    if (section12_nested_frames())                   { fails++; }
+    if (section13_poisoned_writer_short_circuit())   { fails++; }
+
+    if (fails != 0) {
+        fprintf(stderr, "FAIL: %d section(s) failed\n", fails);
         return 1;
     }
 

@@ -80,7 +80,7 @@ typedef enum
     /* Random errors */
     CB_INFO_RNG_BAD_STRIDE,
 
-    /* Bytes */
+    /* Bytes errors */
     CB_INFO_BYTES_OUT_OF_BOUNDS,
     CB_INFO_BYTES_FRAME_TOO_LARGE,
 
@@ -283,6 +283,13 @@ void      cb_rng_shuffle(cb_rng_t *rng, void *base, size_t n, size_t stride);
     writes two placeholder bytes and records the offset; end_frame_u16
     patches those bytes with the body length. read_frame_u16 decodes the
     length and produces a sub-reader bounded to exactly that many bytes.
+
+    cb_bytes_reader_remaining returns 0 on a poisoned reader (info != OK)
+    so the "drained" view matches the sticky-info contract.
+
+    cb_bytes_begin_frame_u16 zeroes *out_mark on every error-return path
+    (sticky-info short-circuit, write failure); callers can rely on
+    *out_mark == 0 after a failed call.
 */
 
 typedef struct
