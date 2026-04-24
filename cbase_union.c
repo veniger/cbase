@@ -6,3 +6,4 @@
 #include "cbase_fixed.c"
 #include "cbase_random.c"
 #include "cbase_bytes.c"
+#include "cbase_time.c"

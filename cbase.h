@@ -84,6 +84,10 @@ typedef enum
     CB_INFO_BYTES_OUT_OF_BOUNDS,
     CB_INFO_BYTES_FRAME_TOO_LARGE,
 
+    /* Time errors */
+    CB_INFO_TIME_BAD_TICK_HZ,
+    CB_INFO_TIME_TICK_LAG,
+
 } cb_info_t;
 
 /* SEG Memory / Arena Allocator */
@@ -349,6 +353,63 @@ size_t    cb_bytes_reader_remaining(const cb_bytes_reader_t *r);
 cb_info_t cb_bytes_begin_frame_u16(cb_bytes_writer_t *w, size_t *out_mark);
 cb_info_t cb_bytes_end_frame_u16  (cb_bytes_writer_t *w, size_t mark);
 cb_info_t cb_bytes_read_frame_u16 (cb_bytes_reader_t *r, cb_bytes_reader_t *out_sub);
+
+/* SEG Time */
+
+/*
+    Monotonic nanosecond clock + accumulator-based fixed-timestep loop helper.
+
+    Clock:
+    - cb_time_now_ns returns a monotonically non-decreasing nanosecond counter.
+      Epoch is implementation-defined (NOT wall clock); only differences are
+      meaningful. Safe to call from any thread; no global locks.
+      POSIX / macOS: clock_gettime(CLOCK_MONOTONIC).
+      Windows:       QueryPerformanceCounter + QueryPerformanceFrequency.
+    - cb_time_now_us / cb_time_now_ms are thin wrappers for ergonomics.
+    - cb_time_sleep_ms blocks the calling thread for approximately ms
+      milliseconds (POSIX nanosleep / Win32 Sleep).
+
+    Tick loop:
+    - cb_tick_loop_t is a single-owner (not thread-safe) helper that turns
+      real-time elapsed into an integer number of fixed-size simulation steps.
+      The outer (render) loop calls cb_tick_loop_advance once per frame and
+      advances the sim that many times.
+    - Configure with a target tick rate (Hz) and a death-spiral cap: if the
+      computed tick count exceeds max_ticks_per_call, the excess accumulator
+      is thrown away and CB_INFO_TIME_TICK_LAG is reported on the step AND
+      stored on loop->info so callers can inspect once at the end.
+    - cb_tick_loop_alpha returns the fractional remainder of the accumulator
+      in [0, CB_FX16_ONE - 1], useful as a render-side interpolation alpha.
+*/
+
+uint64_t cb_time_now_ns(void);
+uint64_t cb_time_now_us(void);
+uint64_t cb_time_now_ms(void);
+void     cb_time_sleep_ms(uint32_t ms);
+
+typedef struct
+{
+    cb_info_t info;
+    uint64_t  tick_ns;             /* configured step duration in ns (0 on bad-hz init) */
+    uint32_t  max_ticks_per_call;  /* death-spiral clamp; 0 means no clamp */
+    uint64_t  last_time_ns;        /* timestamp of previous advance call */
+    uint64_t  accumulator_ns;      /* elapsed ns not yet turned into ticks */
+    uint64_t  sim_tick_index;      /* total ticks advanced since create/reset */
+    bool      started;             /* false until the first advance call */
+} cb_tick_loop_t;
+
+typedef struct
+{
+    cb_info_t info;
+    uint32_t  ticks_to_run;        /* number of sim steps the caller should run NOW */
+    uint64_t  first_tick_index;    /* sim_tick_index of the FIRST step in this batch */
+    uint64_t  leftover_ns;         /* accumulator remainder after the ticks subtract */
+} cb_tick_loop_step_t;
+
+cb_tick_loop_t      cb_tick_loop_create(uint32_t tick_hz, uint32_t max_ticks_per_call);
+cb_tick_loop_step_t cb_tick_loop_advance(cb_tick_loop_t *loop);
+cb_fx16_t           cb_tick_loop_alpha(const cb_tick_loop_t *loop);
+void                cb_tick_loop_reset(cb_tick_loop_t *loop);
 
 /* SEG System Stuff */
 
