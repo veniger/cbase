@@ -112,6 +112,7 @@ typedef enum
     CB_INFO_NETSIM_BUF_TOO_SMALL,     /* recv out_cap < datagram len */
     CB_INFO_NETSIM_ALLOC_FAILED,
     CB_INFO_NETSIM_BAD_PARAMS,        /* e.g. latency_ms_min > latency_ms_max */
+    CB_INFO_NETSIM_PAYLOAD_TOO_LARGE, /* send len > CB_NETSIM_MAX_DATAGRAM_BYTES */
 
 } cb_info_t;
 
@@ -850,6 +851,12 @@ cb_info_t cb_net_poll(cb_net_pollable_t *items, size_t count, int timeout_ms);
  * references `cb_net_addr_t` from SEG Network, so the declarations live
  * after SEG Network in this header.
  */
+
+/* Upper bound on a single datagram's payload length accepted by send_to.
+ * Matches the maximum UDP datagram length field (2^16-1), so real-wire UDP
+ * payloads always fit. Sends with len > this cap return
+ * CB_INFO_NETSIM_PAYLOAD_TOO_LARGE; no state changes. */
+#define CB_NETSIM_MAX_DATAGRAM_BYTES ((size_t)65535)
 
 typedef uint64_t (*cb_netsim_clock_fn)(void *user);
 

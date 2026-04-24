@@ -35,11 +35,14 @@ struct cb__netsim_endpoint_t
 {
     cb__netsim_endpoint_t *next;
     cb_net_addr_t          addr;
-    bool                   open;      /* false once cb_netsim_close'd */
     /* Ready FIFO, chained via cb__netsim_pending_t.next */
     cb__netsim_pending_t  *ready_head;
     cb__netsim_pending_t  *ready_tail;
-    uint32_t               bytes_in_flight;  /* pending + ready */
+    /* Queue-cap accounting (pending + ready). Widened to u64 so the cap
+     * comparison in send_to cannot overflow even with many endpoints /
+     * pathological cumulative flight. Upper-bounded per-send by the
+     * CB_NETSIM_MAX_DATAGRAM_BYTES check on len. */
+    uint64_t               bytes_in_flight;
 };
 
 /* --- Helpers --- */
@@ -63,7 +66,7 @@ static cb__netsim_endpoint_t *cb__netsim_find_endpoint(cb_netsim_t *net,
     cb__netsim_endpoint_t *e = net->endpoints;
     while (e)
     {
-        if (e->open && e->addr.ip == addr.ip && e->addr.port == addr.port)
+        if (e->addr.ip == addr.ip && e->addr.port == addr.port)
             return e;
         e = e->next;
     }
@@ -129,7 +132,7 @@ static void cb__netsim_enqueue_node(cb_netsim_t *net,
     cb__netsim_endpoint_t *dest_ep = cb__netsim_find_endpoint(net, node->dest);
     if (dest_ep)
     {
-        dest_ep->bytes_in_flight += (uint32_t)node->len;
+        dest_ep->bytes_in_flight += (uint64_t)node->len;
     }
     cb__netsim_pending_insert(net, node);
 }
@@ -238,7 +241,6 @@ cb_netsim_endpoint_t cb_netsim_bind(cb_netsim_t *net, cb_net_addr_t addr)
     }
     e->next              = net->endpoints;
     e->addr              = addr;
-    e->open              = true;
     e->ready_head        = NULL;
     e->ready_tail        = NULL;
     e->bytes_in_flight   = 0;
@@ -250,15 +252,54 @@ cb_netsim_endpoint_t cb_netsim_bind(cb_netsim_t *net, cb_net_addr_t addr)
 void cb_netsim_close(cb_netsim_endpoint_t *ep)
 {
     if (!ep || !ep->net) return;
-    cb__netsim_endpoint_t *e = cb__netsim_find_endpoint(ep->net, ep->addr);
-    if (!e) return;
+    cb_netsim_t *net = ep->net;
 
-    /* Drop the endpoint's ready FIFO. Pending in-flight entries targeting
-     * this address stay in the pending list and will be silently discarded
-     * when they mature (find_endpoint returns NULL -> dropped). */
-    cb__netsim_drop_endpoint_ready(ep->net, e);
-    e->open = false;
+    /* Unlink the endpoint from net->endpoints. Hard-delete (not a tombstone)
+     * so a later cb_netsim_bind on the same addr starts a fresh endpoint and
+     * cannot inherit orphaned pending datagrams from the closed one. */
+    cb__netsim_endpoint_t **link = &net->endpoints;
+    cb__netsim_endpoint_t  *e    = NULL;
+    while (*link)
+    {
+        cb__netsim_endpoint_t *cur = *link;
+        if (cur->addr.ip == ep->addr.ip && cur->addr.port == ep->addr.port)
+        {
+            e     = cur;
+            *link = cur->next;
+            break;
+        }
+        link = &cur->next;
+    }
+    if (!e)
+    {
+        ep->net = NULL;
+        return;
+    }
 
+    /* Drop the endpoint's ready FIFO. */
+    cb__netsim_drop_endpoint_ready(net, e);
+
+    /* Scrub any pending entries addressed to this endpoint — they would
+     * otherwise mis-deliver to a rebind at the same addr (or fall through to
+     * a silent stat_dropped at step time, which is the same outcome but
+     * wastes memory until matured). Count each as a drop. */
+    cb__netsim_pending_t **plink = &net->pending;
+    while (*plink)
+    {
+        cb__netsim_pending_t *p = *plink;
+        if (p->dest.ip == ep->addr.ip && p->dest.port == ep->addr.port)
+        {
+            *plink = p->next;
+            cb__netsim_free_node(net, p);
+            net->stat_dropped++;
+        }
+        else
+        {
+            plink = &p->next;
+        }
+    }
+
+    cb__free(net->arena, e);
     ep->net = NULL;
 }
 
@@ -324,6 +365,15 @@ cb_info_t cb_netsim_send_to(cb_netsim_endpoint_t *ep,
     if (!ep || !ep->net) return CB_INFO_GENERIC_ERROR;
     cb_netsim_t *net = ep->net;
 
+    /* Payload size cap: reject BEFORE touching any counter or state so a
+     * too-large send is a pure, observable failure with no side effects.
+     * Also guarantees the (size_t -> uint64_t) accounting below cannot
+     * silently truncate on 32-bit size_t platforms. */
+    if (len > CB_NETSIM_MAX_DATAGRAM_BYTES)
+    {
+        return CB_INFO_NETSIM_PAYLOAD_TOO_LARGE;
+    }
+
     net->stat_enqueued++;
 
     /* Destination-not-bound -> silent drop (counts as drop). */
@@ -335,9 +385,12 @@ cb_info_t cb_netsim_send_to(cb_netsim_endpoint_t *ep,
     }
 
     /* Queue cap check BEFORE random rolls so rolls happen only for enqueued
-     * packets — keeps determinism cleaner w.r.t. capacity behavior. */
+     * packets — keeps determinism cleaner w.r.t. capacity behavior. All
+     * arithmetic in u64; len is bounded above by CB_NETSIM_MAX_DATAGRAM_BYTES
+     * so `in_flight + len` cannot wrap. */
     if (net->params.max_queue_bytes != 0 &&
-        dest_ep->bytes_in_flight + (uint32_t)len > net->params.max_queue_bytes)
+        dest_ep->bytes_in_flight + (uint64_t)len >
+            (uint64_t)net->params.max_queue_bytes)
     {
         net->stat_queue_full++;
         return CB_INFO_OK;
@@ -450,8 +503,8 @@ cb_info_t cb_netsim_recv_from(cb_netsim_endpoint_t *ep,
     }
     *out_len = node->len;
 
-    if (e->bytes_in_flight >= (uint32_t)node->len)
-        e->bytes_in_flight -= (uint32_t)node->len;
+    if (e->bytes_in_flight >= (uint64_t)node->len)
+        e->bytes_in_flight -= (uint64_t)node->len;
     else
         e->bytes_in_flight = 0;
 

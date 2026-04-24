@@ -731,6 +731,127 @@ static int section15_arena_backed(void)
     return 0;
 }
 
+/* ---------- section 16 ---------- */
+
+/* Regression: closing an endpoint must scrub pending datagrams addressed to
+ * it and hard-delete the endpoint node. Otherwise a later bind on the same
+ * addr receives packets that belonged to the old endpoint. */
+static int section16_close_scrubs_pending_and_rebind(void)
+{
+    printf("--- Section 16: close scrubs pending; rebind does not inherit\n");
+    g_clock_ns = 0;
+    cb_netsim_params_t p = zero_params();
+    p.latency_ms_min = 50;
+    p.latency_ms_max = 50;
+    cb_netsim_t net = cb_netsim_create(NULL, 0xABCDull, p);
+    cb_netsim_set_clock(&net, manual_clock, NULL);
+
+    cb_net_addr_t aaddr = make_addr(0x7F000001, 16000);
+    cb_net_addr_t baddr = make_addr(0x7F000001, 16001);
+    cb_netsim_endpoint_t a = cb_netsim_bind(&net, aaddr);
+    cb_netsim_endpoint_t b = cb_netsim_bind(&net, baddr);
+    CHECK(a.info == CB_INFO_OK && b.info == CB_INFO_OK, "binds");
+
+    uint8_t payload[4] = {0x01, 0x02, 0x03, 0x04};
+    CHECK(cb_netsim_send_to(&a, baddr, payload, 4) == CB_INFO_OK, "send");
+    CHECK(net.stat_enqueued == 1, "enqueued 1");
+    CHECK(net.stat_dropped  == 0, "no drops yet");
+
+    /* Close B while the datagram is still pending. */
+    cb_netsim_close(&b);
+    CHECK(net.stat_dropped == 1, "close scrubbed the pending datagram");
+    CHECK(b.net == NULL,         "close cleared handle net ptr");
+
+    /* Rebind B at the same addr while clock has not yet reached delivery time. */
+    g_clock_ns = 10000000ull;
+    cb_netsim_endpoint_t b2 = cb_netsim_bind(&net, baddr);
+    CHECK(b2.info == CB_INFO_OK, "rebind B");
+
+    /* Advance past original delivery time. The scrubbed packet must NOT
+     * appear on the new endpoint's FIFO. */
+    g_clock_ns = 100000000ull;
+    uint32_t moved = cb_netsim_step(&net);
+    CHECK(moved == 0, "step after rebind moves nothing");
+
+    uint8_t buf[16];
+    size_t got = 0;
+    cb_net_addr_t src;
+    cb_info_t info = cb_netsim_recv_from(&b2, &src, buf, sizeof(buf), &got);
+    CHECK(info == CB_INFO_NETSIM_EMPTY, "new B sees no orphan datagram");
+
+    /* And a fresh round-trip on the new endpoint works as normal. */
+    CHECK(cb_netsim_send_to(&a, baddr, payload, 4) == CB_INFO_OK, "fresh send");
+    g_clock_ns = 100000000ull + 50000000ull;
+    cb_netsim_step(&net);
+    info = cb_netsim_recv_from(&b2, &src, buf, sizeof(buf), &got);
+    CHECK(info == CB_INFO_OK && got == 4, "fresh delivery works");
+    CHECK(memcmp(buf, payload, 4) == 0, "fresh payload matches");
+
+    cb_netsim_destroy(&net);
+    printf("  PASS\n");
+    return 0;
+}
+
+/* ---------- section 17 ---------- */
+
+/* send_to rejects len > CB_NETSIM_MAX_DATAGRAM_BYTES with no side effects,
+ * and accepts len == cap. */
+static int section17_payload_size_cap(void)
+{
+    printf("--- Section 17: payload size cap\n");
+    g_clock_ns = 0;
+    cb_netsim_t net = cb_netsim_create(NULL, 0xF00Dull, zero_params());
+    cb_netsim_set_clock(&net, manual_clock, NULL);
+
+    cb_net_addr_t aaddr = make_addr(0x7F000001, 17000);
+    cb_net_addr_t baddr = make_addr(0x7F000001, 17001);
+    cb_netsim_endpoint_t a = cb_netsim_bind(&net, aaddr);
+    cb_netsim_endpoint_t b = cb_netsim_bind(&net, baddr);
+    CHECK(a.info == CB_INFO_OK && b.info == CB_INFO_OK, "binds");
+
+    /* Legal: exactly CB_NETSIM_MAX_DATAGRAM_BYTES. */
+    size_t legal_len = CB_NETSIM_MAX_DATAGRAM_BYTES;
+    uint8_t *legal = (uint8_t *)malloc(legal_len);
+    CHECK(legal != NULL, "alloc legal buf");
+    for (size_t i = 0; i < legal_len; ++i) legal[i] = (uint8_t)(i & 0xFFu);
+    cb_info_t info = cb_netsim_send_to(&a, baddr, legal, legal_len);
+    CHECK(info == CB_INFO_OK, "send @cap ok");
+    CHECK(net.stat_enqueued == 1, "enqueued");
+
+    cb_netsim_step(&net);
+    uint8_t *rbuf = (uint8_t *)malloc(legal_len);
+    CHECK(rbuf != NULL, "alloc recv buf");
+    size_t got = 0;
+    cb_net_addr_t src;
+    info = cb_netsim_recv_from(&b, &src, rbuf, legal_len, &got);
+    CHECK(info == CB_INFO_OK, "recv @cap ok");
+    CHECK(got == legal_len, "recv @cap len");
+    CHECK(memcmp(rbuf, legal, legal_len) == 0, "payload @cap matches");
+
+    /* Illegal: cap + 1. Must NOT touch stat_enqueued/stat_dropped. */
+    uint32_t enq_before  = net.stat_enqueued;
+    uint32_t drop_before = net.stat_dropped;
+    size_t   over_len    = CB_NETSIM_MAX_DATAGRAM_BYTES + 1u;
+    uint8_t *over        = (uint8_t *)malloc(over_len);
+    CHECK(over != NULL, "alloc over buf");
+    memset(over, 0x5Au, over_len);
+    info = cb_netsim_send_to(&a, baddr, over, over_len);
+    CHECK(info == CB_INFO_NETSIM_PAYLOAD_TOO_LARGE, "over-cap rejected");
+    CHECK(net.stat_enqueued == enq_before,  "no enqueue on reject");
+    CHECK(net.stat_dropped  == drop_before, "no drop on reject");
+
+    cb_netsim_step(&net);
+    info = cb_netsim_recv_from(&b, &src, rbuf, legal_len, &got);
+    CHECK(info == CB_INFO_NETSIM_EMPTY, "nothing delivered from over-cap send");
+
+    free(legal);
+    free(rbuf);
+    free(over);
+    cb_netsim_destroy(&net);
+    printf("  PASS\n");
+    return 0;
+}
+
 /* ---------- main ---------- */
 
 int main(void)
@@ -753,6 +874,8 @@ int main(void)
     if (section13_bad_params())          fails++;
     if (section14_flush())               fails++;
     if (section15_arena_backed())        fails++;
+    if (section16_close_scrubs_pending_and_rebind()) fails++;
+    if (section17_payload_size_cap())    fails++;
 
     if (fails != 0) {
         fprintf(stderr, "FAIL: %d section(s) failed\n", fails);
