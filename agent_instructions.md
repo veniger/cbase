@@ -65,6 +65,9 @@ cbase is a cross-platform (Windows, Linux, macOS) single-file C99 utility librar
   - Saturating arithmetic on overflow (sign-correct to MIN/MAX). Division by zero returns MAX or MIN per dividend sign; `div(0,0) = 0`. `abs(MIN) = MAX`. sqrt of negative = 0. atan2(0,0) = 0.
   - Q32.32 `mul`/`div`/`sqrt` use `__int128` on GCC/Clang, `_mul128`/`_udiv128` on MSVC. 64-bit targets only on Windows.
   - Section 6 of `test_apps/fixed_test.c` is a pinned 10000-iteration accumulator that acts as a cross-platform determinism canary. If it fails on a new arch, investigate before anything else (most likely suspect: `cb_fx32_mul` rounding direction on the MSVC path).
+- **Bytes** (`cbase_bytes.c`): bounded byte-buffer reader/writer + u16 length-prefix frame helper. Little-endian on all hosts (explicit byte shifts, not host-order casts), no allocations (caller provides the buffer).
+  - Sticky info: once `info` goes non-OK on a writer or reader, every subsequent op short-circuits and keeps returning that code without advancing `pos`. Callers may chain writes/reads and check once at the end.
+  - Frame helpers: `begin_frame_u16` writes two placeholder bytes and hands back a mark, `end_frame_u16` patches the mark with the body length (errors `CB_INFO_BYTES_FRAME_TOO_LARGE` if > UINT16_MAX), `read_frame_u16` decodes a length-prefixed body as a bounded sub-reader.
 - **Network** (`cbase_network.c`): cross-platform UDP + TCP transport. Raw byte transport only — no framing, no tag, no reliability. Callers layer `[tag][struct bytes]` or whatever they need on top.
   - POSIX: BSD sockets + `poll()`; `cb_net_init` installs `SIG_IGN` for `SIGPIPE`
   - Windows: Winsock2 + `WSAPoll` (Vista+); `cb_net_init` calls `WSAStartup(2.2)`
@@ -83,6 +86,7 @@ cbase_threading.c    - Threading implementation (POSIX + Win32)
 cbase_network.c      - UDP/TCP transport (POSIX BSD sockets + Win32 Winsock2)
 cbase_fixed.c        - Deterministic fixed-point math (Q16.16, Q32.32, BRAD)
 cbase_random.c       - PCG32 deterministic PRNG (u32/u64, bounded, fx16, BRAD, shuffle)
+cbase_bytes.c        - Bounded byte-buffer reader/writer + u16 length-prefix frame helper
 test_apps/           - Test programs (one .c file each)
 build/               - Compiled test binaries (gitignored)
 Makefile             - Build system (cross-platform)

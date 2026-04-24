@@ -80,6 +80,10 @@ typedef enum
     /* Random errors */
     CB_INFO_RNG_BAD_STRIDE,
 
+    /* Bytes */
+    CB_INFO_BYTES_OUT_OF_BOUNDS,
+    CB_INFO_BYTES_FRAME_TOO_LARGE,
+
 } cb_info_t;
 
 /* SEG Memory / Arena Allocator */
@@ -258,6 +262,86 @@ bool      cb_rng_chance_fx16(cb_rng_t *rng, cb_fx16_t probability); /* p<=0 -> f
    If stride > cap, sets rng->info = CB_INFO_RNG_BAD_STRIDE and returns without
    touching the array. n <= 1 is a no-op. */
 void      cb_rng_shuffle(cb_rng_t *rng, void *base, size_t n, size_t stride);
+
+/* SEG Bytes */
+
+/*
+    Bounded byte-buffer reader/writer with a tiny length-prefix frame helper.
+
+    - No allocations. All functions operate on caller-provided buffers.
+    - All multi-byte integers are encoded and decoded little-endian on every
+      host; the code uses explicit byte shifts rather than assuming host
+      byte order, so it is correct on any platform.
+    - Sticky info: once a writer's or reader's info is non-OK (out-of-bounds,
+      frame too large), every subsequent op short-circuits and keeps
+      returning that same info without mutating pos. This lets callers run
+      a chain of writes or reads and inspect info once at the end.
+    - On error, info is set AND the error is returned. pos is never advanced
+      on a failed op.
+
+    Frame helpers use a u16 (little-endian) length prefix. begin_frame_u16
+    writes two placeholder bytes and records the offset; end_frame_u16
+    patches those bytes with the body length. read_frame_u16 decodes the
+    length and produces a sub-reader bounded to exactly that many bytes.
+*/
+
+typedef struct
+{
+    cb_info_t  info;
+    uint8_t   *data;
+    size_t     cap;
+    size_t     pos;
+} cb_bytes_writer_t;
+
+typedef struct
+{
+    cb_info_t      info;
+    const uint8_t *data;
+    size_t         len;
+    size_t         pos;
+} cb_bytes_reader_t;
+
+/* --- Writer --- */
+
+cb_bytes_writer_t cb_bytes_writer_init(uint8_t *buf, size_t cap);
+
+cb_info_t cb_bytes_write_u8    (cb_bytes_writer_t *w, uint8_t  v);
+cb_info_t cb_bytes_write_u16_le(cb_bytes_writer_t *w, uint16_t v);
+cb_info_t cb_bytes_write_u32_le(cb_bytes_writer_t *w, uint32_t v);
+cb_info_t cb_bytes_write_u64_le(cb_bytes_writer_t *w, uint64_t v);
+
+cb_info_t cb_bytes_write_i8    (cb_bytes_writer_t *w, int8_t  v);
+cb_info_t cb_bytes_write_i16_le(cb_bytes_writer_t *w, int16_t v);
+cb_info_t cb_bytes_write_i32_le(cb_bytes_writer_t *w, int32_t v);
+cb_info_t cb_bytes_write_i64_le(cb_bytes_writer_t *w, int64_t v);
+
+cb_info_t cb_bytes_write_bytes(cb_bytes_writer_t *w, const void *src, size_t n);
+
+size_t    cb_bytes_writer_len(const cb_bytes_writer_t *w);
+
+/* --- Reader --- */
+
+cb_bytes_reader_t cb_bytes_reader_init(const uint8_t *buf, size_t len);
+
+cb_info_t cb_bytes_read_u8    (cb_bytes_reader_t *r, uint8_t  *out);
+cb_info_t cb_bytes_read_u16_le(cb_bytes_reader_t *r, uint16_t *out);
+cb_info_t cb_bytes_read_u32_le(cb_bytes_reader_t *r, uint32_t *out);
+cb_info_t cb_bytes_read_u64_le(cb_bytes_reader_t *r, uint64_t *out);
+
+cb_info_t cb_bytes_read_i8    (cb_bytes_reader_t *r, int8_t  *out);
+cb_info_t cb_bytes_read_i16_le(cb_bytes_reader_t *r, int16_t *out);
+cb_info_t cb_bytes_read_i32_le(cb_bytes_reader_t *r, int32_t *out);
+cb_info_t cb_bytes_read_i64_le(cb_bytes_reader_t *r, int64_t *out);
+
+cb_info_t cb_bytes_read_bytes(cb_bytes_reader_t *r, void *out, size_t n);
+
+size_t    cb_bytes_reader_remaining(const cb_bytes_reader_t *r);
+
+/* --- Length-prefix frame helpers (u16, little-endian) --- */
+
+cb_info_t cb_bytes_begin_frame_u16(cb_bytes_writer_t *w, size_t *out_mark);
+cb_info_t cb_bytes_end_frame_u16  (cb_bytes_writer_t *w, size_t mark);
+cb_info_t cb_bytes_read_frame_u16 (cb_bytes_reader_t *r, cb_bytes_reader_t *out_sub);
 
 /* SEG System Stuff */
 
