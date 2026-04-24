@@ -852,6 +852,117 @@ static int section17_payload_size_cap(void)
     return 0;
 }
 
+/* ---------- section 18 ---------- */
+
+/* Duplicates count against max_queue_bytes. With a cap of 160 bytes and a
+ * 40-byte datagram at 100% dup, the first send enqueues 2 * 40 = 80 bytes;
+ * the second 2 * 40 = 80 bytes (total 160, equal to cap); the third's primary
+ * would push total to 200, so it's rejected at enqueue. */
+static int section18_dup_under_queue_cap(void)
+{
+    printf("--- Section 18: duplicates count against queue cap\n");
+    g_clock_ns = 0;
+    cb_netsim_params_t p = zero_params();
+    p.dup_prob        = CB_FX16_ONE;
+    p.max_queue_bytes = 160u;
+    cb_netsim_t net = cb_netsim_create(NULL, 0x12345ull, p);
+    cb_netsim_set_clock(&net, manual_clock, NULL);
+
+    cb_net_addr_t aaddr = make_addr(0x7F000001, 18000);
+    cb_net_addr_t baddr = make_addr(0x7F000001, 18001);
+    cb_netsim_endpoint_t a = cb_netsim_bind(&net, aaddr);
+    cb_netsim_endpoint_t b = cb_netsim_bind(&net, baddr);
+    CHECK(a.info == CB_INFO_OK && b.info == CB_INFO_OK, "binds");
+
+    uint8_t chunk[40];
+    memset(chunk, 0x99, sizeof(chunk));
+
+    /* Three sends; first two succeed (80 + 80 = 160), third rejected at cap. */
+    CHECK(cb_netsim_send_to(&a, baddr, chunk, sizeof(chunk)) == CB_INFO_OK, "s1");
+    CHECK(cb_netsim_send_to(&a, baddr, chunk, sizeof(chunk)) == CB_INFO_OK, "s2");
+    CHECK(cb_netsim_send_to(&a, baddr, chunk, sizeof(chunk)) == CB_INFO_OK, "s3");
+
+    CHECK(net.stat_enqueued == 3,    "enqueued == 3");
+    CHECK(net.stat_duplicated == 2,  "first two produced dups (2 rolls fired)");
+    CHECK(net.stat_queue_full == 1,  "third send dropped at cap");
+
+    cb_netsim_destroy(&net);
+    printf("  PASS\n");
+    return 0;
+}
+
+/* ---------- section 19 ---------- */
+
+/* With 100% corruption + 100% dup, each of the two delivered copies should be
+ * corrupted independently — most of the time the two flipped bit positions
+ * will differ. We iterate many packets and assert that at least one pair of
+ * (copy1, copy2) received payloads differs from each other, i.e. the two
+ * copies were NOT corrupted identically (which would indicate the same RNG
+ * draw was reused between copies). */
+static int section19_corrupt_dup_independence(void)
+{
+    printf("--- Section 19: corruption + dup roll independently per copy\n");
+    g_clock_ns = 0;
+    cb_netsim_params_t p = zero_params();
+    p.dup_prob     = CB_FX16_ONE;
+    p.corrupt_prob = CB_FX16_ONE;
+    cb_netsim_t net = cb_netsim_create(NULL, 0xABCDEF01ull, p);
+    cb_netsim_set_clock(&net, manual_clock, NULL);
+
+    cb_net_addr_t aaddr = make_addr(0x7F000001, 19000);
+    cb_net_addr_t baddr = make_addr(0x7F000001, 19001);
+    cb_netsim_endpoint_t a = cb_netsim_bind(&net, aaddr);
+    cb_netsim_endpoint_t b = cb_netsim_bind(&net, baddr);
+    CHECK(a.info == CB_INFO_OK && b.info == CB_INFO_OK, "binds");
+
+    const int  N = 64;              /* packets sent */
+    const size_t PAYLOAD_LEN = 32;  /* large enough that random bit positions rarely collide */
+    uint8_t original[32];
+    for (size_t i = 0; i < PAYLOAD_LEN; ++i) original[i] = (uint8_t)(0xA5u ^ (uint8_t)i);
+
+    for (int i = 0; i < N; ++i) {
+        CHECK(cb_netsim_send_to(&a, baddr, original, PAYLOAD_LEN) == CB_INFO_OK, "send");
+    }
+    cb_netsim_step(&net);
+
+    int copies_differ = 0;
+    int pairs_checked = 0;
+    for (int i = 0; i < N; ++i) {
+        uint8_t c1[32], c2[32];
+        size_t g1 = 0, g2 = 0;
+        cb_net_addr_t src;
+        cb_info_t i1 = cb_netsim_recv_from(&b, &src, c1, sizeof(c1), &g1);
+        cb_info_t i2 = cb_netsim_recv_from(&b, &src, c2, sizeof(c2), &g2);
+        CHECK(i1 == CB_INFO_OK && i2 == CB_INFO_OK, "recv both copies");
+        CHECK(g1 == PAYLOAD_LEN && g2 == PAYLOAD_LEN, "copy lens");
+        pairs_checked++;
+        if (memcmp(c1, c2, PAYLOAD_LEN) != 0) copies_differ++;
+
+        /* Sanity: each copy has exactly one bit flip vs the original. */
+        int flips_c1 = 0, flips_c2 = 0;
+        for (size_t k = 0; k < PAYLOAD_LEN; ++k) {
+            uint8_t x1 = (uint8_t)(c1[k] ^ original[k]);
+            uint8_t x2 = (uint8_t)(c2[k] ^ original[k]);
+            while (x1) { flips_c1 += (x1 & 1); x1 >>= 1; }
+            while (x2) { flips_c2 += (x2 & 1); x2 >>= 1; }
+        }
+        CHECK(flips_c1 == 1 && flips_c2 == 1, "each copy flipped exactly one bit");
+    }
+
+    /* With independent draws over 32*8 = 256 bit positions, the probability
+     * that all 64 primary/dup pairs happen to land on the same bit is
+     * (1/256)^64 ≈ 0. Require at least a large majority to differ. */
+    CHECK(pairs_checked == N, "all pairs checked");
+    CHECK(copies_differ >= (N * 3) / 4,
+          "most dup pairs must differ — confirms independent corruption rolls");
+    CHECK(net.stat_corrupted == (uint32_t)(2 * N),
+          "stat_corrupted counts each copy (primary + dup)");
+
+    cb_netsim_destroy(&net);
+    printf("  PASS (%d / %d pairs differ)\n", copies_differ, pairs_checked);
+    return 0;
+}
+
 /* ---------- main ---------- */
 
 int main(void)
@@ -876,6 +987,8 @@ int main(void)
     if (section15_arena_backed())        fails++;
     if (section16_close_scrubs_pending_and_rebind()) fails++;
     if (section17_payload_size_cap())    fails++;
+    if (section18_dup_under_queue_cap()) fails++;
+    if (section19_corrupt_dup_independence()) fails++;
 
     if (fails != 0) {
         fprintf(stderr, "FAIL: %d section(s) failed\n", fails);

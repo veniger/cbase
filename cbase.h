@@ -887,6 +887,12 @@ cb_info_t cb_net_poll(cb_net_pollable_t *items, size_t count, int timeout_ms);
  *     but tests can install a manual clock (returning user-controlled values)
  *     to pin schedule behavior without wall time.
  *
+ *     Contract: the default `cb_time_now_ns` clock is for debugging / ad-hoc
+ *     exploration only. Deterministic runs (replay/regression suites, golden-
+ *     trace tests, CI) MUST install a manual clock via cb_netsim_set_clock —
+ *     otherwise scheduling races the real monotonic clock and cross-run
+ *     byte-identity is not guaranteed.
+ *
  * Segment placement note: conceptually this follows SEG Hash, but the API
  * references `cb_net_addr_t` from SEG Network, so the declarations live
  * after SEG Network in this header.

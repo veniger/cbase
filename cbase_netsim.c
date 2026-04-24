@@ -335,9 +335,11 @@ static bool cb__netsim_enqueue_copy(cb_netsim_t *net,
     /* Corruption roll (per-copy). Flip one random bit in the payload. */
     if (len > 0 && cb_rng_chance_fx16(&net->rng, net->params.corrupt_prob))
     {
-        /* Draw a bit index in [0, len*8). len <= uint32 by contract
-         * (we're test-scale), so u32_below is safe. */
-        uint32_t bits = (uint32_t)len * 8u;
+        /* Draw a bit index in [0, len*8). send_to enforces
+         * len <= CB_NETSIM_MAX_DATAGRAM_BYTES (65535), so bits fits
+         * comfortably in uint32_t (max 524_280) with no overflow risk
+         * regardless of size_t width on the host. */
+        uint32_t bits = (uint32_t)(len * 8u);
         uint32_t bit  = cb_rng_u32_below(&net->rng, bits);
         node->payload[bit >> 3] ^= (uint8_t)(1u << (bit & 7u));
         net->stat_corrupted++;
