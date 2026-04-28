@@ -564,8 +564,19 @@ cb_config_bool_t cb_config_get_bool(const cb_config_t *cfg, const char *key, boo
 
     Sink lifetime:
       - cb_log_set_file_sink(NULL) detaches; non-NULL attaches. Caller retains
-        ownership and is responsible for fclose. Not safe to call concurrently
-        with logging — invoke during setup/teardown.
+        ownership and is responsible for fclose. The setter takes the logger
+        mutex internally, so it is safe to call concurrently with cb_log; the
+        call serializes behind any in-flight fwrite. Call ordering matters
+        for *which* sink a given line lands in, though.
+
+    Write errors:
+      - fwrite short-writes to either sink are recorded on a sticky global
+        "last error" that cb_log_last_error returns. A successful subsequent
+        log call does NOT clear it — call cb_log_clear_last_error to reset
+        once you've observed the failure. This exists because cb_log never
+        propagates errors to its caller (by design — logging must not
+        destabilize the caller) but the operator still needs a way to know
+        the sink is dropping lines.
 
     No convenience macros are exposed. Userland may define CB_LOG_INFO(...) etc.
     on top of cb_log(...) without conflicting with common names.
@@ -591,12 +602,19 @@ cb_log_level_t cb_log_get_level(void);
 void           cb_log_set_color(bool enabled);
 void           cb_log_set_timestamps(bool enabled);
 
-/* Attach/detach the secondary sink. NULL detaches. Not thread-safe w.r.t.
-   concurrent log calls — call during setup/teardown. Ownership is NOT
-   transferred; caller must fclose. Returns CB_INFO_OK in both cases. */
+/* Attach/detach the secondary sink. NULL detaches. Thread-safe with concurrent
+   log calls — the setter takes the logger mutex and serializes behind any
+   in-flight fwrite. Ownership is NOT transferred; caller must fclose.
+   Returns CB_INFO_OK in both cases. */
 cb_info_t      cb_log_set_file_sink(FILE *f);
 
 void           cb_log(cb_log_level_t level, const char *module, const char *fmt, ...);
+
+/* Sticky last-error accessor. Returns CB_INFO_OK if no write failure has been
+ * observed since init (or since cb_log_clear_last_error), otherwise the
+ * CB_INFO_LOG_* code for the most recent failure. Thread-safe. */
+cb_info_t      cb_log_last_error(void);
+void           cb_log_clear_last_error(void);
 
 /* SEG Hash */
 

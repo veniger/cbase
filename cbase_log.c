@@ -46,6 +46,7 @@ static struct {
     FILE            *file_sink;
     uint64_t         start_ns;
     cb_mutex_t       mu;
+    cb_info_t        last_error;    /* sticky; see cb_log_last_error */
 } cb__log = {
     false,
     CB_LOG_INFO,
@@ -59,7 +60,8 @@ static struct {
 #else
      {0}
 #endif
-    }
+    },
+    CB_INFO_OK
 };
 
 /* --- Lazy init (POSIX pthread_once / Windows InitOnceExecuteOnce) --- */
@@ -81,6 +83,7 @@ static void cb__log_do_init(void)
     cb__log.file_sink   = NULL;
     cb__log.start_ns    = cb_time_now_ns();
     cb__log.mu          = cb_mutex_create();
+    cb__log.last_error  = CB_INFO_OK;
     cb__log.initialized = true;
 }
 
@@ -107,6 +110,7 @@ static BOOL CALLBACK cb__log_do_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
     cb__log.file_sink   = NULL;
     cb__log.start_ns    = cb_time_now_ns();
     cb__log.mu          = cb_mutex_create();
+    cb__log.last_error  = CB_INFO_OK;
     cb__log.initialized = true;
     return TRUE;
 }
@@ -161,13 +165,31 @@ void cb_log_set_timestamps(bool enabled)
 cb_info_t cb_log_set_file_sink(FILE *f)
 {
     cb__log_ensure_init();
-    /* Documented as NOT thread-safe w.r.t. concurrent log calls. We still
-       take the mutex so the pointer swap is atomic w.r.t. a simultaneous
-       cb_log() that happens to slip in. */
+    /* Serializes behind any concurrent cb_log via the logger mutex — so this
+     * IS safe to call from another thread while logs are flowing. In
+     * practice most callers still do it at setup/teardown, but there is no
+     * longer a correctness reason to avoid mid-run swaps. */
     cb_mutex_lock(&cb__log.mu);
     cb__log.file_sink = f;
     cb_mutex_unlock(&cb__log.mu);
     return CB_INFO_OK;
+}
+
+cb_info_t cb_log_last_error(void)
+{
+    cb__log_ensure_init();
+    cb_mutex_lock(&cb__log.mu);
+    cb_info_t info = cb__log.last_error;
+    cb_mutex_unlock(&cb__log.mu);
+    return info;
+}
+
+void cb_log_clear_last_error(void)
+{
+    cb__log_ensure_init();
+    cb_mutex_lock(&cb__log.mu);
+    cb__log.last_error = CB_INFO_OK;
+    cb_mutex_unlock(&cb__log.mu);
 }
 
 /* --- Internal formatting helpers --- */
@@ -323,23 +345,32 @@ void cb_log(cb_log_level_t level, const char *module, const char *fmt, ...)
     }
     cb__log_append(plain, sizeof(plain), &ppos, " ");
 
-    /* 4. Formatted message. */
-    /* Leave room for "...[TRUNC]\n" + '\0'. */
-    size_t reserve = strlen(CB__LOG_TRUNC_MARKER) + 1 + 1; /* marker + '\n' + '\0' */
-    size_t msg_cap = (sizeof(plain) > reserve) ? (sizeof(plain) - reserve) : 0;
-    if (ppos < msg_cap) {
+    /* 4. Formatted message.
+     *
+     * Layout of `plain`:
+     *   [ 0 .. ppos )                  prefix (timestamp/level/module)
+     *   [ ppos .. body_end )           formatted body
+     *   [ body_end .. body_end+10 )    "...[TRUNC]" marker (only if truncated)
+     *   [ final_pos ]                  trailing '\n'
+     *
+     * Reserve marker_len + 1 trailing bytes unconditionally so the marker
+     * (when used) and the trailing newline both fit without stomping each
+     * other. fwrite uses an explicit length — we never null-terminate. */
+    const size_t marker_len  = sizeof(CB__LOG_TRUNC_MARKER) - 1;
+    const size_t body_end_max = sizeof(plain) - marker_len - 1;
+
+    if (ppos < body_end_max) {
+        /* vsnprintf reserves +1 for its own NUL terminator. */
+        size_t avail = body_end_max - ppos + 1;
         va_list ap;
         va_start(ap, fmt);
-        int written = vsnprintf(plain + ppos, msg_cap - ppos, fmt, ap);
+        int written = vsnprintf(plain + ppos, avail, fmt, ap);
         va_end(ap);
         if (written < 0) {
             /* Formatter error: nothing to append. */
-        } else if ((size_t)written >= msg_cap - ppos) {
-            /* Message was truncated by vsnprintf. */
-            ppos = msg_cap - 1; /* we had msg_cap - ppos - 1 usable chars */
-            /* Actually vsnprintf wrote (msg_cap - ppos - 1) chars and a NUL at
-               plain[msg_cap - 1]. Advance ppos to msg_cap - 1. */
-            ppos = msg_cap - 1;
+        } else if ((size_t)written >= avail) {
+            /* vsnprintf wrote (avail - 1) chars + NUL at plain[body_end_max]. */
+            ppos += avail - 1;
             truncated = true;
         } else {
             ppos += (size_t)written;
@@ -349,20 +380,13 @@ void cb_log(cb_log_level_t level, const char *module, const char *fmt, ...)
     }
 
     if (truncated) {
-        /* Append truncation marker. */
-        cb__log_append(plain, sizeof(plain), &ppos, CB__LOG_TRUNC_MARKER);
+        /* Marker fits unconditionally because of the trailing reserve. */
+        memcpy(plain + ppos, CB__LOG_TRUNC_MARKER, marker_len);
+        ppos += marker_len;
     }
 
-    /* 5. Trailing newline. */
-    if (ppos + 1 < sizeof(plain)) {
-        plain[ppos++] = '\n';
-    } else {
-        /* Force newline at the very end. */
-        plain[sizeof(plain) - 2] = '\n';
-        ppos = sizeof(plain) - 1;
-    }
-    /* plain is now ppos bytes of content; we do NOT null-terminate because we
-       use fwrite with an explicit length. */
+    /* 5. Trailing newline — always fits via the reserve above. */
+    plain[ppos++] = '\n';
 
     /* Build the colored stderr buffer if needed. */
     char colored[CB__LOG_BUF_SZ + 32];
@@ -399,16 +423,22 @@ void cb_log(cb_log_level_t level, const char *module, const char *fmt, ...)
     }
 
     /* Emit under the mutex so lines from concurrent threads don't interleave
-       within a single fwrite. */
+       within a single fwrite. Short writes (or full failures) are stashed
+       in cb__log.last_error rather than thrown back at the caller — logging
+       must not destabilize the rest of the program. */
     cb_mutex_lock(&cb__log.mu);
 
     size_t w = fwrite(stderr_buf, 1, stderr_len, stderr);
-    (void)w; /* short write is silently swallowed — logging must not destabilize callers. */
+    if (w < stderr_len) {
+        cb__log.last_error = CB_INFO_LOG_WRITE_FAILED;
+    }
     fflush(stderr);
 
     if (file_sink != NULL) {
         size_t wf = fwrite(plain, 1, ppos, file_sink);
-        (void)wf;
+        if (wf < ppos) {
+            cb__log.last_error = CB_INFO_LOG_WRITE_FAILED;
+        }
         fflush(file_sink);
     }
 

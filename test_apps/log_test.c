@@ -20,6 +20,8 @@
  *  12. File sink detach.
  *  13. Thread safety: 4 x 200 = 800 interleaved log lines remain well-formed.
  *  14. Timestamps monotonically non-decreasing.
+ *  15. Truncation boundary: exact-fit body emits clean line; +1 byte trips marker.
+ *  16. Sticky last_error API smoke test (clear/get round-trip).
  */
 
 #include <stdio.h>
@@ -637,6 +639,108 @@ static int section14_monotonic(void)
     return 0;
 }
 
+/* ---------- Section 15: truncation boundary ---------- */
+
+/* Exercises the exact transition between "fits cleanly" and "marker tripped".
+ *
+ * Buffer layout (with timestamps off + module "t"):
+ *   prefix  = level_tag(5) + ' ' + module_padded(6) + ' '   = 13 bytes
+ *   reserve = strlen("...[TRUNC]") + 1 (newline)            = 11 bytes
+ *   body_end_max         = sizeof(plain) - reserve          = 4085
+ *   max clean body bytes = body_end_max - prefix            = 4072
+ *   first truncated body = 4073
+ */
+static int section15_truncation_boundary(void)
+{
+    printf("--- Section 15: truncation boundary\n");
+
+    cb_log_set_level(CB_LOG_INFO);
+    cb_log_set_color(false);
+    cb_log_set_timestamps(false);
+
+    static char body_clean[4073];      /* 4072 + NUL */
+    static char body_trunc[4074];      /* 4073 + NUL */
+    memset(body_clean, 'x', sizeof(body_clean) - 1);
+    body_clean[sizeof(body_clean) - 1] = '\0';
+    memset(body_trunc, 'x', sizeof(body_trunc) - 1);
+    body_trunc[sizeof(body_trunc) - 1] = '\0';
+
+    /* Clean case: 4072-byte body should emit one full line ending in '\n'
+       with no truncation marker. */
+    {
+        FILE *tmp = redirect_stderr_to_tmp();
+        CHECK(tmp != NULL, "tmpfile clean");
+        cb_log(CB_LOG_INFO, "t", "%s", body_clean);
+
+        static char buf[8192];
+        size_t n = slurp(tmp, buf, sizeof(buf));
+        restore_stderr();
+        fclose(tmp);
+
+        /* Expected total: prefix(13) + body(4072) + '\n'(1) = 4086. */
+        CHECK(n == 4086, "clean line is exactly 4086 bytes");
+        CHECK(buf[n - 1] == '\n', "clean line ends with newline");
+        CHECK(strstr(buf, "[TRUNC]") == NULL, "no truncation marker on clean line");
+    }
+
+    /* Truncated case: 4073-byte body should emit one line of exactly the full
+       buffer size (4096) ending in "...[TRUNC]\n". */
+    {
+        FILE *tmp = redirect_stderr_to_tmp();
+        CHECK(tmp != NULL, "tmpfile trunc");
+        cb_log(CB_LOG_INFO, "t", "%s", body_trunc);
+
+        static char buf[8192];
+        size_t n = slurp(tmp, buf, sizeof(buf));
+        restore_stderr();
+        fclose(tmp);
+
+        const char *trunc = "...[TRUNC]\n";
+        size_t tl = strlen(trunc);
+        CHECK(n == 4096, "truncated line is exactly 4096 bytes");
+        CHECK(strcmp(buf + n - tl, trunc) == 0, "truncated line ends with ...[TRUNC]\\n");
+        /* Marker must appear exactly once — no self-stomp. */
+        CHECK(count_substr(buf, "[TRUNC]") == 1, "marker appears exactly once");
+    }
+
+    printf("  section 15 OK (clean=4086, truncated=4096)\n");
+    return 0;
+}
+
+/* ---------- Section 16: sticky last_error ---------- */
+
+static int section16_sticky_last_error(void)
+{
+    printf("--- Section 16: sticky last_error\n");
+
+    cb_log_set_level(CB_LOG_INFO);
+    cb_log_set_color(false);
+    cb_log_set_timestamps(false);
+
+    /* After a clear, last_error reports OK. */
+    cb_log_clear_last_error();
+    CHECK(cb_log_last_error() == CB_INFO_OK, "cleared error reads OK");
+
+    /* A normal log call to a working stderr should not flip the sticky bit. */
+    FILE *tmp = redirect_stderr_to_tmp();
+    CHECK(tmp != NULL, "tmpfile s16");
+    cb_log(CB_LOG_INFO, "t", "S16-normal");
+    static char buf[256];
+    slurp(tmp, buf, sizeof(buf));
+    restore_stderr();
+    fclose(tmp);
+    CHECK(cb_log_last_error() == CB_INFO_OK, "successful log leaves last_error OK");
+    CHECK(strstr(buf, "S16-normal") != NULL, "normal line still emitted");
+
+    /* Idempotent clear. */
+    cb_log_clear_last_error();
+    cb_log_clear_last_error();
+    CHECK(cb_log_last_error() == CB_INFO_OK, "double-clear is idempotent");
+
+    printf("  section 16 OK\n");
+    return 0;
+}
+
 /* ---------- main ---------- */
 
 int main(void)
@@ -667,6 +771,8 @@ int main(void)
     if (section12_file_sink_detach())   { fails++; }
     if (section13_thread_safety())      { fails++; }
     if (section14_monotonic())          { fails++; }
+    if (section15_truncation_boundary()){ fails++; }
+    if (section16_sticky_last_error())  { fails++; }
 
     if (fails != 0) {
         fprintf(stdout, "FAIL: %d section(s) failed\n", fails);
