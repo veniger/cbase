@@ -60,6 +60,8 @@ static bool cb__netsim_params_ok(const cb_netsim_params_t *p)
     return true;
 }
 
+/* Endpoints are hard-deleted on close; no tombstones to skip, so this walk
+ * does not need to filter on any "open" flag. */
 static cb__netsim_endpoint_t *cb__netsim_find_endpoint(cb_netsim_t *net,
                                                        cb_net_addr_t addr)
 {

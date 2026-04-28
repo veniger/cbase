@@ -245,5 +245,8 @@ void cb_tick_loop_reset(cb_tick_loop_t *loop)
     loop->accumulator_ns = 0;
     loop->sim_tick_index = 0;
     loop->started        = false;
-    /* tick_ns and max_ticks_per_call are preserved. */
+    /* tick_ns, max_ticks_per_call, clock_fn, and clock_user are preserved
+     * (matches the header contract — reset rewinds the running state but
+     * leaves construction-time configuration intact, including any custom
+     * clock that was installed via cb_tick_loop_set_clock). */
 }

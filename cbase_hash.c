@@ -306,6 +306,15 @@ void cb_hmac_sha256_final(cb_hmac_sha256_ctx_t *ctx,
     memset(ctx,          0, sizeof(*ctx));
 }
 
+void cb_hmac_sha256_abort(cb_hmac_sha256_ctx_t *ctx)
+{
+    /* Mirrors the scrub that _final performs, but without producing a digest.
+     * For callers that abandon an in-flight HMAC: wipes the ipad-keyed inner
+     * SHA state plus the prepared opad so neither is left on the caller's
+     * stack. Safe on a freshly-init'd ctx (memset is unconditional). */
+    memset(ctx, 0, sizeof(*ctx));
+}
+
 void cb_hmac_sha256(const void *key, size_t key_len,
                     const void *msg, size_t msg_len,
                     uint8_t out[CB_HMAC_SHA256_DIGEST_LEN])

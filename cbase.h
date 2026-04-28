@@ -519,7 +519,9 @@ typedef struct
 cb_config_t cb_config_parse(cb_arena_t *arena, const char *text, size_t len);
 
 /* Load from a file on disk. Returns CB_INFO_CONFIG_FILE_OPEN_FAILED on open
-   error. Files larger than 16 MiB error with CB_INFO_CONFIG_FILE_TOO_LARGE. */
+   error. Files larger than 16 MiB error with CB_INFO_CONFIG_FILE_TOO_LARGE.
+   Arena-backed callers that re-parse repeatedly should cb_arena_reset between
+   reloads; otherwise the arena monotonically grows (see SEG Config above). */
 cb_config_t cb_config_parse_file(cb_arena_t *arena, const char *path);
 
 /* Frees all entries (via cb__free per entry). Safe on a failed parse. */
@@ -581,6 +583,9 @@ cb_config_bool_t cb_config_get_bool(const cb_config_t *cfg, const char *key, boo
         propagates errors to its caller (by design — logging must not
         destabilize the caller) but the operator still needs a way to know
         the sink is dropping lines.
+      - Contract is first-failure-wins: once last_error is non-OK, neither
+        a later sink in the same call nor a later cb_log call overwrites it
+        until cb_log_clear_last_error is called.
 
     No convenience macros are exposed. Userland may define CB_LOG_INFO(...) etc.
     on top of cb_log(...) without conflicting with common names.
@@ -664,6 +669,14 @@ void cb_sha256_final (cb_sha256_ctx_t *ctx, uint8_t out[CB_SHA256_DIGEST_LEN]);
     bytes per the spec. Shorter keys are zero-padded to the block size. Both
     one-shot and streaming variants are provided; the streaming ctx keeps the
     inner SHA state plus the prepared opad for the final step.
+
+    Lifetime contract — keyed state must be scrubbed:
+      - The streaming ctx (cb_hmac_sha256_ctx_t) holds the ipad-keyed inner
+        SHA state and the prepared opad. Both contain key-derived material.
+      - cb_hmac_sha256_final wipes the ctx as part of producing the digest.
+      - Callers that abandon a ctx without calling _final MUST instead call
+        cb_hmac_sha256_abort to wipe the keyed state — otherwise key-derived
+        bytes remain on the caller's stack until the frame is overwritten.
 */
 
 #define CB_HMAC_SHA256_DIGEST_LEN CB_SHA256_DIGEST_LEN
@@ -683,6 +696,13 @@ void cb_hmac_sha256_init  (cb_hmac_sha256_ctx_t *ctx, const void *key, size_t ke
 void cb_hmac_sha256_update(cb_hmac_sha256_ctx_t *ctx, const void *data, size_t len);
 void cb_hmac_sha256_final (cb_hmac_sha256_ctx_t *ctx,
                            uint8_t out[CB_HMAC_SHA256_DIGEST_LEN]);
+
+/* Wipe the keyed state of a ctx without producing a digest. Use this when an
+ * in-flight HMAC is abandoned (error path, early return, etc.) so that the
+ * ipad-keyed inner SHA state and the prepared opad don't linger on the
+ * caller's stack. After this call the ctx is logically destroyed; re-init
+ * before any further use. Safe to call on a freshly-init'd ctx. */
+void cb_hmac_sha256_abort (cb_hmac_sha256_ctx_t *ctx);
 
 /* SEG System Stuff */
 

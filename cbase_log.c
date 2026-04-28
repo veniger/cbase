@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <assert.h>
 
 #ifdef CB_PLATFORM_POSIX
     #include <unistd.h>
@@ -46,7 +47,12 @@ static struct {
     FILE            *file_sink;
     uint64_t         start_ns;
     cb_mutex_t       mu;
-    cb_info_t        last_error;    /* sticky; see cb_log_last_error */
+    cb_info_t        last_error;    /* sticky; see cb_log_last_error.
+                                     * Contract: first-failure-wins. Once set
+                                     * to non-OK, subsequent failures (in the
+                                     * same call or later) do NOT overwrite —
+                                     * the operator sees the original cause
+                                     * until cb_log_clear_last_error. */
 } cb__log = {
     false,
     CB_LOG_INFO,
@@ -385,7 +391,15 @@ void cb_log(cb_log_level_t level, const char *module, const char *fmt, ...)
         ppos += marker_len;
     }
 
-    /* 5. Trailing newline — always fits via the reserve above. */
+    /* 5. Trailing newline — always fits via the reserve above.
+     *
+     * Belt-and-braces against future edits to the buffer-size or marker:
+     * CB__LOG_BUF_SZ must always leave at least one byte for '\n' beyond
+     * the truncation marker, and ppos must be strictly inside `plain`
+     * before we write the newline. */
+    _Static_assert(sizeof(plain) > sizeof(CB__LOG_TRUNC_MARKER),
+                   "cb_log: plain[] must be larger than marker + newline");
+    assert(ppos < sizeof(plain));
     plain[ppos++] = '\n';
 
     /* Build the colored stderr buffer if needed. */
@@ -428,15 +442,18 @@ void cb_log(cb_log_level_t level, const char *module, const char *fmt, ...)
        must not destabilize the rest of the program. */
     cb_mutex_lock(&cb__log.mu);
 
+    /* First-failure-wins: only stamp last_error if it is currently CB_INFO_OK,
+     * so the operator sees the original failure (e.g. stderr) even if a later
+     * sink (e.g. file) also fails on the same call. */
     size_t w = fwrite(stderr_buf, 1, stderr_len, stderr);
-    if (w < stderr_len) {
+    if (w < stderr_len && cb__log.last_error == CB_INFO_OK) {
         cb__log.last_error = CB_INFO_LOG_WRITE_FAILED;
     }
     fflush(stderr);
 
     if (file_sink != NULL) {
         size_t wf = fwrite(plain, 1, ppos, file_sink);
-        if (wf < ppos) {
+        if (wf < ppos && cb__log.last_error == CB_INFO_OK) {
             cb__log.last_error = CB_INFO_LOG_WRITE_FAILED;
         }
         fflush(file_sink);
