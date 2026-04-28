@@ -1074,6 +1074,75 @@ cb_info_t            cb_netsim_recv_from(cb_netsim_endpoint_t *ep,
 /* Drops all pending and ready datagrams on the whole net. Stats preserved. */
 void                 cb_netsim_flush(cb_netsim_t *net);
 
+/* SEG Transport */
+
+/*
+ * cb_transport_t — swappable I/O indirection for connectionless datagram
+ * traffic. The plan-mandated invariant for explorers (and any other cbase
+ * consumer that wants this) is "all I/O goes through one indirection," so
+ * a runtime can be driven by either real UDP or the in-process cb_netsim
+ * without the caller knowing which.
+ *
+ * Shape: classic C vtable. A `cb_transport_t` carries a `void *impl` and a
+ * `const cb_transport_ops_t *ops`. The two factories `cb_transport_udp` and
+ * `cb_transport_netsim` set up the vtable from the underlying handle the
+ * caller already owns. The transport does NOT take ownership of that
+ * underlying handle — the caller is still responsible for cb_udp_open /
+ * cb_netsim_bind and their pairing close/destroy. cb_transport_close is a
+ * convenience that forwards to the underlying close-equivalent (cb_udp_close
+ * for the udp adapter; a no-op for the netsim adapter, since the endpoint's
+ * lifetime is owned by the netsim instance).
+ *
+ * Return-code normalization across backends:
+ *   - send returns cb_net_io_result_t. The udp adapter passes through; the
+ *     netsim adapter returns {info=CB_INFO_OK, bytes=size} on enqueue success
+ *     (netsim drops are SILENT — same as real UDP), bytes=0 on failure.
+ *   - recv returns cb_udp_recv_result_t. The udp adapter passes through; the
+ *     netsim adapter maps CB_INFO_NETSIM_EMPTY to CB_INFO_NET_WOULD_BLOCK so
+ *     callers can poll-and-retry uniformly without branching on backend.
+ *
+ * Single-threaded. The udp adapter has the same threading constraints as the
+ * underlying socket; the netsim adapter inherits cb_netsim's single-threaded
+ * contract. No locking inside the vtable itself.
+ */
+
+typedef struct cb_transport_t cb_transport_t;
+
+typedef struct
+{
+    cb_net_io_result_t   (*send) (void *impl, cb_net_addr_t to,
+                                  const void *data, size_t size);
+    cb_udp_recv_result_t (*recv) (void *impl, void *buf, size_t buf_size);
+    cb_info_t            (*close)(void *impl);
+} cb_transport_ops_t;
+
+struct cb_transport_t
+{
+    cb_info_t                 info;   /* CB_INFO_OK once the factory wired up */
+    const cb_transport_ops_t *ops;
+    void                     *impl;   /* cb_udp_socket_t* or cb_netsim_endpoint_t* */
+};
+
+/* Build a transport that wraps a real UDP socket. The caller still owns the
+ * cb_udp_socket_t pointer (and must keep it alive for the transport's life;
+ * the vtable holds a borrowed pointer, no copy). */
+cb_transport_t cb_transport_udp   (cb_udp_socket_t      *udp);
+
+/* Build a transport that wraps a netsim endpoint. Same ownership contract:
+ * the caller's cb_netsim_endpoint_t lives at least as long as the transport.
+ * cb_transport_close on this adapter is a no-op — call cb_netsim_close on
+ * your endpoint when you're done with the netsim instance. */
+cb_transport_t cb_transport_netsim(cb_netsim_endpoint_t *ep);
+
+/* Thin dispatchers — one virtual call each. Kept as inlines-of-spirit (not
+ * literal `inline` so the function-pointer model stays explicit) so the
+ * compiler can devirtualize when the transport's ops pointer is known. */
+cb_net_io_result_t   cb_transport_send (cb_transport_t *t, cb_net_addr_t to,
+                                        const void *data, size_t size);
+cb_udp_recv_result_t cb_transport_recv (cb_transport_t *t,
+                                        void *buf, size_t buf_size);
+cb_info_t            cb_transport_close(cb_transport_t *t);
+
 /* SEG IO */
 
 #endif

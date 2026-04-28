@@ -19,3 +19,4 @@ _Static_assert(CB_INFO__LAST < CB_INFO__USER_BASE,
 #include "cbase_log.c"
 #include "cbase_hash.c"
 #include "cbase_netsim.c"
+#include "cbase_transport.c"
