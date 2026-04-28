@@ -488,6 +488,10 @@ void                cb_tick_loop_set_clock(cb_tick_loop_t *loop,
         falls back to malloc/free.
       - cb_config_destroy is safe on a failed parse and safe on both allocator
         modes.
+      - In arena mode, cb_config_destroy walks the entry list but the per-entry
+        cb__free calls are no-ops (the arena reclaims in bulk). Long-running
+        callers that re-parse repeatedly should periodically cb_arena_reset
+        the arena themselves; otherwise the arena monotonically grows.
 
     Typed getters:
       - Integer parsing is base-10 only, no hex, no oct, no underscores.
@@ -911,6 +915,13 @@ cb_info_t cb_net_poll(cb_net_pollable_t *items, size_t count, int timeout_ms);
  *     trace tests, CI) MUST install a manual clock via cb_netsim_set_clock —
  *     otherwise scheduling races the real monotonic clock and cross-run
  *     byte-identity is not guaranteed.
+ *
+ * Allocation:
+ *   In arena mode, cb_netsim_close and cb_netsim_destroy walk the endpoint
+ *   and pending lists but the per-node cb__free calls are no-ops (the arena
+ *   reclaims in bulk). Long-running sims that churn endpoints / datagrams
+ *   should periodically cb_arena_reset between scenarios; otherwise the
+ *   arena monotonically grows.
  *
  * Segment placement note: conceptually this follows SEG Hash, but the API
  * references `cb_net_addr_t` from SEG Network, so the declarations live
