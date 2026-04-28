@@ -1,5 +1,13 @@
 #include "cbase.h"
 
+/* Pin the cbase/user info-code partition at compile time. cbase reserves
+ * codes below 0x1000; user code (e.g. explorers) starts at 0x1000. The
+ * sentinel CB_INFO__LAST is the last enumerator in cb_info_t, so this
+ * static assert fires the moment a new cbase code would cross the line. */
+#define CB_INFO__USER_BASE 0x1000
+_Static_assert(CB_INFO__LAST < CB_INFO__USER_BASE,
+    "cbase info codes must fit below CB_INFO__USER_BASE so the user (explorers) namespace stays clean");
+
 #include "cbase_arena.c"
 #include "cbase_threading.c"
 #include "cbase_network.c"

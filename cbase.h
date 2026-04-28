@@ -114,6 +114,10 @@ typedef enum
     CB_INFO_NETSIM_BAD_PARAMS,        /* e.g. latency_ms_min > latency_ms_max */
     CB_INFO_NETSIM_PAYLOAD_TOO_LARGE, /* send len > CB_NETSIM_MAX_DATAGRAM_BYTES */
 
+    /* Sentinel: must remain the LAST enumerator. The cbase amalgamation TU
+     * static-asserts CB_INFO__LAST < CB_INFO__USER_BASE (0x1000) so the user
+     * (e.g. explorers) info-code namespace stays clean. */
+    CB_INFO__LAST,
 } cb_info_t;
 
 /* SEG Memory / Arena Allocator */
